@@ -1010,46 +1010,28 @@ def test_graph_tokenizer_trainer_writes_manifest_output(tmp_path):
 
 
 
-def test_graph_tokenizer_trainer_loads_json_config(tmp_path):
-    trainer = _load_trainer_module()
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({"dataset": "molhiv", "runs": 3}), encoding="utf-8")
-
-    assert trainer.load_config_file(str(config_path)) == {"dataset": "molhiv", "runs": 3}
-
-
-def test_graph_tokenizer_trainer_applies_config_defaults_and_cli_overrides(tmp_path):
-    trainer = _load_trainer_module()
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps({"dataset": "molhiv", "model": "gte", "runs": 3, "n_epoch": 5}),
-        encoding="utf-8",
-    )
-
-    args = trainer.parse_args_with_config([
-        "--config",
-        str(config_path),
-        "--dataset",
-        "qm9",
-        "--runs",
-        "1",
-    ])
-
-    assert args.config == str(config_path)
-    assert args.dataset == "qm9"
-    assert args.model == "gte"
-    assert args.runs == 1
-    assert args.n_epoch == 5
-
-
 def test_graph_tokenizer_trainer_parses_paper_protocol_options():
     trainer = _load_trainer_module()
 
-    args = trainer.parse_args_with_config([
+    args = trainer.parse_args([
         "--protocol", "paper",
         "--dataset", "qm9",
+        "--model", "gte",
         "--target-property", "homo",
         "--device", "cuda:0",
+        "--pretrain-epoch", "200",
+        "--n-epoch", "200",
+        "--pretrain-lr", "0.00005",
+        "--lr", "0.00001",
+        "--batch-size", "32",
+        "--weight-decay", "0.1",
+        "--pretrain-warmup-ratio", "0.12",
+        "--finetune-warmup-ratio", "0.025",
+        "--pretrain-max-grad-norm", "2.0",
+        "--finetune-max-grad-norm", "0.5",
+        "--mask-prob", "0.09",
+        "--patience", "20",
+        "--max-position-embeddings", "8192",
         "--paper-amp", "bf16",
         "--paper-tf32",
         "--paper-loss", "huber",
@@ -1059,27 +1041,23 @@ def test_graph_tokenizer_trainer_parses_paper_protocol_options():
     assert args.protocol == "paper"
     assert args.target_property == "homo"
     assert args.device == "cuda:0"
+    assert args.pretrain_epoch == 200
+    assert args.n_epoch == 200
+    assert args.pretrain_lr == 5e-5
+    assert args.lr == 1e-5
+    assert args.batch_size == 32
+    assert args.weight_decay == 0.1
+    assert args.pretrain_warmup_ratio == 0.12
+    assert args.finetune_warmup_ratio == 0.025
+    assert args.pretrain_max_grad_norm == 2.0
+    assert args.finetune_max_grad_norm == 0.5
+    assert args.mask_prob == 0.09
+    assert args.patience == 20
+    assert args.max_position_embeddings == 8192
     assert args.paper_amp == "bf16"
     assert args.paper_tf32 is True
     assert args.paper_loss == "huber"
     assert args.molhiv_pos_weight is True
-
-
-def test_graph_tokenizer_trainer_writes_resolved_config(tmp_path):
-    trainer = _load_trainer_module()
-
-    class Args:
-        dataset = "p-struct"
-        model = "bert"
-        output_dir = "logs"
-        write_config = str(tmp_path / "resolved.json")
-
-    path = trainer.write_resolved_config(Args())
-
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    assert data["dataset"] == "p-struct"
-    assert data["model"] == "bert"
-    assert data["write_config"] == str(tmp_path / "resolved.json")
 
 
 

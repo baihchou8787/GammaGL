@@ -224,99 +224,40 @@ def test_paper_protocol_uses_five_seeds_from_42_when_runs_is_unspecified():
     assert protocol.paper_run_seeds(args) == [42, 43, 44, 45, 46]
 
 
-@pytest.mark.parametrize("dataset", ["qm9", "molhiv", "peptides-struct"])
-def test_paper_preset_uses_exact_gte_feuler_context_for_every_dataset(dataset):
-    protocol = _load_paper_protocol_module()
-    args = SimpleNamespace(model=None, paper_config=None)
-    spec = SimpleNamespace(canonical_name=dataset)
-
-    preset = protocol.load_paper_preset(args, spec)
-
-    assert preset["encoder"] == "gte"
-    assert preset["serialization"] == "feuler"
-    assert preset["max_position_embeddings"] == 8192
-
-
-def test_paper_cli_performance_options_override_preset():
+def test_paper_training_options_are_read_from_argparse_namespace():
     protocol = _load_paper_protocol_module()
     args = SimpleNamespace(
-        model=None,
-        paper_config=None,
+        model="gte",
+        serialization="feuler",
+        pretrain_epoch=200,
+        n_epoch=200,
+        pretrain_lr=5e-5,
+        lr=1e-5,
+        batch_size=32,
+        weight_decay=0.1,
+        pretrain_warmup_ratio=0.12,
+        finetune_warmup_ratio=0.025,
+        pretrain_max_grad_norm=2.0,
+        finetune_max_grad_norm=0.5,
+        mask_prob=0.09,
+        patience=20,
+        max_position_embeddings=8192,
         paper_amp="bf16",
         paper_tf32=True,
         paper_loss="huber",
         molhiv_pos_weight=True,
     )
 
-    preset = protocol.load_paper_preset(
-        args, SimpleNamespace(canonical_name="qm9"))
+    options = protocol.paper_training_options(args)
 
-    assert preset["amp_dtype"] == "bf16"
-    assert preset["allow_tf32"] is True
-    assert preset["training_loss"] == "huber"
-    assert preset["molhiv_pos_weight"] is True
-
-
-def test_bert_cli_without_config_uses_complete_bert_paper_defaults():
-    protocol = _load_paper_protocol_module()
-    preset = protocol.load_paper_preset(
-        SimpleNamespace(model="bert", paper_config=None),
-        SimpleNamespace(canonical_name="qm9"),
-    )
-
-    assert preset["encoder"] == "bert"
-    assert preset["max_position_embeddings"] == 768
-    assert preset["pretrain_lr"] == 1e-4
-
-
-def test_paper_protocol_rejects_model_and_config_encoder_mismatch():
-    protocol = _load_paper_protocol_module()
-    config_path = (
-        Path(__file__).resolve().parents[2]
-        / "examples"
-        / "graph_tokenizer"
-        / "configs"
-        / "qm9_bert_paper.json"
-    )
-
-    with pytest.raises(ValueError, match="encoder"):
-        protocol.load_paper_preset(
-            SimpleNamespace(model="gte", paper_config=str(config_path)),
-            SimpleNamespace(canonical_name="qm9"),
-        )
-
-
-@pytest.mark.parametrize(
-    ("dataset", "config_name", "batch_size", "finetune_lr"),
-    [
-        ("qm9", "qm9_bert_paper.json", 32, 1e-5),
-        ("molhiv", "molhiv_bert_paper.json", 32, 5e-5),
-        ("peptides-struct", "peptides_struct_bert_paper.json", 16, 1e-5),
-    ],
-)
-def test_bert_paper_configs_resolve_exact_training_protocol(
-        dataset, config_name, batch_size, finetune_lr):
-    protocol = _load_paper_protocol_module()
-    config_path = (
-        Path(__file__).resolve().parents[2]
-        / "examples"
-        / "graph_tokenizer"
-        / "configs"
-        / config_name
-    )
-    args = SimpleNamespace(model="bert", paper_config=str(config_path))
-    spec = SimpleNamespace(canonical_name=dataset)
-
-    preset = protocol.load_paper_preset(args, spec)
-
-    assert preset == {
-        "encoder": "bert",
+    assert options == {
+        "encoder": "gte",
         "serialization": "feuler",
         "pretrain_epochs": 200,
         "finetune_epochs": 200,
-        "pretrain_lr": 1e-4,
-        "finetune_lr": finetune_lr,
-        "batch_size": batch_size,
+        "pretrain_lr": 5e-5,
+        "finetune_lr": 1e-5,
+        "batch_size": 32,
         "weight_decay": 0.1,
         "pretrain_warmup_ratio": 0.12,
         "finetune_warmup_ratio": 0.025,
@@ -324,7 +265,11 @@ def test_bert_paper_configs_resolve_exact_training_protocol(
         "finetune_max_grad_norm": 0.5,
         "mask_prob": 0.09,
         "patience": 20,
-        "max_position_embeddings": 768,
+        "max_position_embeddings": 8192,
+        "amp_dtype": "bf16",
+        "allow_tf32": True,
+        "training_loss": "huber",
+        "molhiv_pos_weight": True,
     }
 
 
@@ -1256,7 +1201,7 @@ def test_pretrain_complete_state_restores_amp_scaler_before_finetuning():
 
 def test_run_fingerprint_changes_with_seed_and_run_index():
     protocol = _load_paper_protocol_module()
-    preset = protocol.PAPER_PRESETS["qm9"]
+    training_options = {"encoder": "gte", "batch_size": 32}
     spec = SimpleNamespace(
         canonical_name="qm9",
         task_type="regression",
@@ -1264,11 +1209,11 @@ def test_run_fingerprint_changes_with_seed_and_run_index():
     )
 
     first = protocol._experiment_fingerprint(
-        preset, spec, "encoded", 100, "mean", seed=42, run_index=0)
+        training_options, spec, "encoded", 100, "mean", seed=42, run_index=0)
     different_seed = protocol._experiment_fingerprint(
-        preset, spec, "encoded", 100, "mean", seed=43, run_index=0)
+        training_options, spec, "encoded", 100, "mean", seed=43, run_index=0)
     different_run = protocol._experiment_fingerprint(
-        preset, spec, "encoded", 100, "mean", seed=42, run_index=1)
+        training_options, spec, "encoded", 100, "mean", seed=42, run_index=1)
 
     assert len({first, different_seed, different_run}) == 3
 
@@ -1347,17 +1292,26 @@ def test_tiny_paper_protocol_runs_pretrain_finetune_and_five_runs(
         paper_cache_root=str(tmp_path / "cache"),
         resume=False,
     )
-    preset = {
-        **protocol.PAPER_PRESETS["qm9"],
+    training_options = {
         "encoder": "bert",
+        "serialization": "feuler",
         "pretrain_epochs": 1,
         "finetune_epochs": 3,
+        "pretrain_lr": 1e-4,
+        "finetune_lr": 1e-5,
         "patience": 0,
         "batch_size": 2,
+        "weight_decay": 0.1,
+        "pretrain_warmup_ratio": 0.12,
+        "finetune_warmup_ratio": 0.025,
+        "pretrain_max_grad_norm": 2.0,
+        "finetune_max_grad_norm": 0.5,
+        "mask_prob": 0.09,
         "max_position_embeddings": 16,
     }
     monkeypatch.setattr(protocol, "_torch", lambda: torch)
-    monkeypatch.setattr(protocol, "load_paper_preset", lambda _args, _spec: preset)
+    monkeypatch.setattr(
+        protocol, "paper_training_options", lambda _args: training_options)
     monkeypatch.setattr(protocol, "_create_paper_model", lambda **_kwargs: TinyModel())
     scaler_runs = []
     monkeypatch.setattr(

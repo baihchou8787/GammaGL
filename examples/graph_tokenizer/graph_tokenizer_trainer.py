@@ -1392,46 +1392,12 @@ def build_runtime_manifest(args, timestamp: Optional[str] = None) -> Dict[str, A
 
 
 
-def load_config_file(path: str) -> Dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    if not isinstance(config, dict):
-        raise ValueError("Config file must contain a JSON object.")
-    return config
-
-
-def parser_destinations(parser: argparse.ArgumentParser) -> Set[str]:
-    return {action.dest for action in parser._actions if action.dest != argparse.SUPPRESS}
-
-
-def apply_config_defaults(parser: argparse.ArgumentParser, config: Dict[str, Any]) -> None:
-    valid_destinations = parser_destinations(parser)
-    unknown = sorted(set(config) - valid_destinations)
-    if unknown:
-        raise ValueError(f"Unknown config option(s): {', '.join(unknown)}")
-    parser.set_defaults(**config)
-
-
-def parse_args_with_config(argv=None):
-    config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", default=None)
-    config_args, _ = config_parser.parse_known_args(argv)
-
+def parse_args(argv=None):
     parser = build_arg_parser()
-    if config_args.config:
-        apply_config_defaults(parser, load_config_file(config_args.config))
     args = parser.parse_args(argv)
-    if args.model is None and args.protocol != "paper":
-        args.model = "bert"
+    if args.model is None:
+        args.model = "gte" if args.protocol == "paper" else "bert"
     return args
-
-
-def write_resolved_config(args) -> str:
-    path = Path(args.write_config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(serialize_args(args), handle, indent=2)
-    return str(path)
 
 
 
@@ -1890,11 +1856,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, choices=SUPPORTED_MODELS)
     parser.add_argument("--models", default=None, help="Comma-separated model matrix, e.g. bert,gte.")
     parser.add_argument("--protocol", default="gammagl", choices=("gammagl", "paper"))
-    parser.add_argument("--paper-config", default=None, help="Paper-protocol JSON preset override.")
     parser.add_argument(
         "--paper-cache-root",
         default=None,
-        help="Tokenizer/serialization cache root; for formal runs use a path under /local.",
+        help="Tokenizer/serialization cache root.",
     )
     parser.add_argument(
         "--paper-amp", default=None, choices=("off", "fp16", "bf16"),
@@ -1923,12 +1888,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--output-dir", default="logs/graph_tokenizer")
-    parser.add_argument("--config", default=None, help="Load trainer arguments from a JSON config file; explicit CLI flags override it.")
-    parser.add_argument("--write-config", default=None, help="Write the resolved trainer arguments to this JSON file before running.")
     parser.add_argument("--runs", type=int, default=None)
     parser.add_argument("--pretrain-epoch", type=int, default=1)
     parser.add_argument("--pretrain-lr", type=float, default=1e-4)
+    parser.add_argument("--pretrain-warmup-ratio", type=float, default=0.12)
+    parser.add_argument("--pretrain-max-grad-norm", type=float, default=2.0)
     parser.add_argument("--n-epoch", type=int, default=1)
+    parser.add_argument("--finetune-warmup-ratio", type=float, default=0.025)
+    parser.add_argument("--finetune-max-grad-norm", type=float, default=0.5)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -1945,6 +1912,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-hidden-layers", type=int, default=None)
     parser.add_argument("--num-attention-heads", type=int, default=None)
     parser.add_argument("--intermediate-size", type=int, default=None)
+    parser.add_argument("--max-position-embeddings", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--no-save-checkpoint", dest="save_checkpoint", action="store_false")
     parser.add_argument("--resume", action="store_true", help="Skip dataset/model matrix entries whose summary JSON already exists.")
@@ -1957,9 +1925,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    args = parse_args_with_config(argv)
-    if args.write_config:
-        write_resolved_config(args)
+    args = parse_args(argv)
     if args.list_datasets:
         for spec in DATASET_SPECS:
             print(f"{spec.paper_name}: aliases={','.join(spec.aliases)} metric={spec.metric}")

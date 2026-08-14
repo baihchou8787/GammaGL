@@ -16,60 +16,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 
-PAPER_PRESETS = {
-    "qm9": {
-        "encoder": "gte",
-        "serialization": "feuler",
-        "pretrain_epochs": 200,
-        "finetune_epochs": 200,
-        "pretrain_lr": 5e-5,
-        "finetune_lr": 1e-5,
-        "batch_size": 32,
-        "weight_decay": 0.1,
-        "pretrain_warmup_ratio": 0.12,
-        "finetune_warmup_ratio": 0.025,
-        "pretrain_max_grad_norm": 2.0,
-        "finetune_max_grad_norm": 0.5,
-        "mask_prob": 0.09,
-        "patience": 20,
-        "max_position_embeddings": 8192,
-    },
-    "molhiv": {
-        "encoder": "gte",
-        "serialization": "feuler",
-        "pretrain_epochs": 200,
-        "finetune_epochs": 200,
-        "pretrain_lr": 5e-5,
-        "finetune_lr": 5e-5,
-        "batch_size": 32,
-        "weight_decay": 0.1,
-        "pretrain_warmup_ratio": 0.12,
-        "finetune_warmup_ratio": 0.025,
-        "pretrain_max_grad_norm": 2.0,
-        "finetune_max_grad_norm": 0.5,
-        "mask_prob": 0.09,
-        "patience": 20,
-        "max_position_embeddings": 8192,
-    },
-    "peptides-struct": {
-        "encoder": "gte",
-        "serialization": "feuler",
-        "pretrain_epochs": 200,
-        "finetune_epochs": 200,
-        "pretrain_lr": 1e-4,
-        "finetune_lr": 1e-5,
-        "batch_size": 16,
-        "weight_decay": 0.1,
-        "pretrain_warmup_ratio": 0.12,
-        "finetune_warmup_ratio": 0.025,
-        "pretrain_max_grad_norm": 2.0,
-        "finetune_max_grad_norm": 0.5,
-        "mask_prob": 0.09,
-        "patience": 20,
-        "max_position_embeddings": 8192,
-    },
-}
-
 PAPER_RUNTIME_REQUIREMENTS = {
     "torch": "2.1.2",
     "cuda": "12.1",
@@ -313,7 +259,7 @@ def paper_runtime_status() -> Dict[str, Any]:
 
 
 def validate_paper_args(args, spec) -> None:
-    if spec.canonical_name not in PAPER_PRESETS:
+    if spec.canonical_name not in {"qm9", "molhiv", "peptides-struct"}:
         raise ValueError(
             "Paper protocol supports only QM9, OGBG-molhiv and Peptides-struct.")
     if spec.canonical_name == "qm9":
@@ -351,45 +297,35 @@ def _should_skip_finetuning(
     )
 
 
-def load_paper_preset(args, spec) -> Dict[str, Any]:
-    preset = dict(PAPER_PRESETS[spec.canonical_name])
-    config_path = getattr(args, "paper_config", None)
-    override = {}
-    if config_path:
-        with Path(config_path).open("r", encoding="utf-8") as handle:
-            override = json.load(handle)
-        if not isinstance(override, dict):
-            raise ValueError("Paper configuration must be a JSON object.")
-    requested_model = getattr(args, "model", None)
-    configured_model = override.get("encoder")
-    if (
-            requested_model and configured_model
-            and requested_model != configured_model):
-        raise ValueError(
-            f"Requested model encoder={requested_model!r} conflicts with "
-            f"paper configuration encoder={configured_model!r}.")
-    encoder = requested_model or configured_model or preset["encoder"]
-    if encoder == "bert":
-        preset.update({
-            "encoder": "bert",
-            "pretrain_lr": 1e-4,
-            "max_position_embeddings": 768,
-        })
-    elif encoder != "gte":
-        raise ValueError("Paper configuration encoder must be 'bert' or 'gte'.")
-    preset.update(override)
-    preset["encoder"] = encoder
+def paper_training_options(args) -> Dict[str, Any]:
+    options = {
+        "encoder": args.model,
+        "serialization": args.serialization,
+        "pretrain_epochs": args.pretrain_epoch,
+        "finetune_epochs": args.n_epoch,
+        "pretrain_lr": args.pretrain_lr,
+        "finetune_lr": args.lr,
+        "batch_size": args.batch_size,
+        "weight_decay": args.weight_decay,
+        "pretrain_warmup_ratio": args.pretrain_warmup_ratio,
+        "finetune_warmup_ratio": args.finetune_warmup_ratio,
+        "pretrain_max_grad_norm": args.pretrain_max_grad_norm,
+        "finetune_max_grad_norm": args.finetune_max_grad_norm,
+        "mask_prob": args.mask_prob,
+        "patience": args.patience,
+        "max_position_embeddings": args.max_position_embeddings,
+    }
     cli_overrides = {
         "amp_dtype": getattr(args, "paper_amp", None),
         "allow_tf32": getattr(args, "paper_tf32", None),
         "training_loss": getattr(args, "paper_loss", None),
         "molhiv_pos_weight": getattr(args, "molhiv_pos_weight", None),
     }
-    preset.update({
+    options.update({
         key: value for key, value in cli_overrides.items()
         if value is not None
     })
-    return preset
+    return options
 
 
 def set_paper_seed(seed: int, torch) -> None:
@@ -1232,7 +1168,7 @@ def _train_mlm(
 def run_paper_experiment(args, spec, splits, fit_tokenizer):
     validate_paper_args(args, spec)
     torch = _torch()
-    preset = load_paper_preset(args, spec)
+    preset = paper_training_options(args)
     seeds = paper_run_seeds(args)
     if not splits["train"]:
         raise ValueError("Paper protocol refuses an empty training split.")
