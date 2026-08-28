@@ -119,9 +119,16 @@ class FrequencyGuidedEulerianSerializer:
     @staticmethod
     def _validate_undirected_simple(input_edges: Sequence[Tuple[int, int, int]]) -> None:
         labels_by_edge: Dict[Tuple[int, int], int] = {}
+        directed_edges = set()
         for src, dst, label in input_edges:
             if src == dst:
                 raise ValueError("Feuler does not support self-loops.")
+            directed_key = (src, dst)
+            if directed_key in directed_edges:
+                raise ValueError(
+                    "Parallel edges are unsupported by the undirected simple "
+                    "Feuler serializer.")
+            directed_edges.add(directed_key)
             key = (min(src, dst), max(src, dst))
             previous = labels_by_edge.setdefault(key, label)
             if previous != label:

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import hashlib
 import random
 from typing import Any, Dict, List
 
@@ -52,13 +53,26 @@ class GraphTokenizer(BaseTransform):
         self.serializer = serializer or FrequencyGuidedEulerianSerializer()
         self.bpe = bpe or GraphBPE()
         self.special_tokens = special_tokens or GraphTokenizerSpecialTokens()
+        if not hasattr(self.bpe, "protected_token_ids"):
+            self.bpe.protected_token_ids = set()
+        self.bpe.protected_token_ids.add(
+            self.special_tokens.component_sep_token_id)
         self.add_special_tokens = bool(add_special_tokens)
         self._fitted = False
+        self.fit_graph_ids_hash = None
+        self.schema_version = 1
 
-    def fit(self, graphs):
+    def fit(self, graphs, graph_ids=None):
         graphs = list(graphs)
         if not graphs:
             raise ValueError("Cannot fit GraphTokenizer on an empty training corpus.")
+        self.fit_graph_ids_hash = None
+        if graph_ids is not None:
+            graph_ids = list(graph_ids)
+            if len(graph_ids) != len(graphs):
+                raise ValueError("graph_ids must align with the training graphs.")
+            self.fit_graph_ids_hash = hashlib.sha256(
+                repr(tuple(graph_ids)).encode("utf-8")).hexdigest()
         self.serializer.fit(graphs)
         serialized_sequences = [
             self._normalize_serialized_tokens(self.serializer.serialize(graph).token_ids)
@@ -112,6 +126,8 @@ class GraphTokenizer(BaseTransform):
                 },
                 "required_vocab_size": self.max_token_id + 1,
                 "add_special_tokens": self.add_special_tokens,
+                "tokenizer_schema_version": self.schema_version,
+                "fit_graph_ids_hash": self.fit_graph_ids_hash,
             },
         )
 
@@ -148,6 +164,8 @@ class GraphTokenizer(BaseTransform):
                     },
                     "required_vocab_size": self.max_token_id + 1,
                     "add_special_tokens": self.add_special_tokens,
+                    "tokenizer_schema_version": self.schema_version,
+                    "fit_graph_ids_hash": self.fit_graph_ids_hash,
                 },
             ))
         return results

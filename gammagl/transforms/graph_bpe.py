@@ -20,13 +20,23 @@ class BPECodebook:
 class GraphBPE:
     """Minimal public interface for graph-token BPE training and encoding."""
 
-    def __init__(self, num_merges: int = 2000, min_frequency: int = 2, backend: str = "python"):
+    def __init__(
+        self,
+        num_merges: int = 2000,
+        min_frequency: int = 2,
+        backend: str = "python",
+        protected_token_ids=None,
+    ):
         self.num_merges = int(num_merges)
         self.min_frequency = int(min_frequency)
         self.backend = backend
+        self.protected_token_ids = {
+            int(token) for token in (protected_token_ids or ())}
         self.codebook = BPECodebook()
 
     def fit(self, token_sequences):
+        if self.protected_token_ids:
+            return self._fit_python(token_sequences)
         if self.backend == "cpp":
             return self._fit_with_bridge(token_sequences)
         if self.backend == "auto":
@@ -44,7 +54,7 @@ class GraphBPE:
         next_token_id = self._next_token_id(sequences)
 
         for _ in range(self.num_merges):
-            pair_counts = self._count_pairs(sequences)
+            pair_counts = self._count_pairs(sequences, self.protected_token_ids)
             if not pair_counts:
                 break
 
@@ -171,10 +181,15 @@ class GraphBPE:
         return max_token + 1
 
     @staticmethod
-    def _count_pairs(sequences: Iterable[List[int]]) -> Dict[Tuple[int, int], int]:
+    def _count_pairs(
+        sequences: Iterable[List[int]], protected_token_ids=None,
+    ) -> Dict[Tuple[int, int], int]:
         counts: Dict[Tuple[int, int], int] = {}
+        protected_token_ids = set(protected_token_ids or ())
         for sequence in sequences:
             for left, right in zip(sequence, sequence[1:]):
+                if left in protected_token_ids or right in protected_token_ids:
+                    continue
                 pair = (left, right)
                 counts[pair] = counts.get(pair, 0) + 1
         return counts

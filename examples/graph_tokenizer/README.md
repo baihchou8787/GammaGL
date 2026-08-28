@@ -8,6 +8,8 @@ GraphTokenizer is described in [Graph Tokenization for Bridging Graphs and Trans
 
 The paper protocol uses frequency-guided Eulerian serialization (Feuler), fits Graph BPE on the training split only, pretrains with masked language modeling, selects the best fine-tuning checkpoint by validation performance, evaluates the test split once, and reports the mean and population standard deviation over five runs.
 
+The current serializer supports the forward graph-to-token path only. `deserialize()` is intentionally not implemented, so this example must not be described as a reversible graph↔token interface. The native TLX GTE is randomly initialized and is distinct from the paper's pretrained GTE checkpoint.
+
 ## Datasets
 
 The paper commands below cover:

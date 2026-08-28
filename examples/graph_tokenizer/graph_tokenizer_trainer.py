@@ -1,4 +1,5 @@
 ﻿import argparse
+import copy
 import csv
 import hashlib
 import importlib.metadata
@@ -184,10 +185,13 @@ def validate_split_indices(num_samples: int, split_indices: Dict[str, List[int]]
 
 def select_strict_splits(graphs: Sequence[SyntheticGraph], split_indices: Dict[str, List[int]]):
     validate_split_indices(len(graphs), split_indices)
-    return {
-        split_name: [graphs[index] for index in split_indices[split_name]]
-        for split_name in ("train", "val", "test")
-    }
+    splits = {}
+    for split_name in ("train", "val", "test"):
+        split_graphs = [graphs[index] for index in split_indices[split_name]]
+        for graph, graph_id in zip(split_graphs, split_indices[split_name]):
+            graph.graph_tokenizer_id = int(graph_id)
+        splits[split_name] = split_graphs
+    return splits
 
 
 def gammagl_graph_to_synthetic_graph(graph, spec: DatasetSpec) -> SyntheticGraph:
@@ -220,10 +224,10 @@ def flatten_feature_ids(values) -> List[int]:
     values = to_list(values)
     flattened = []
     for item in values:
-        while is_sequence(item):
-            if not item:
-                item = 0
-                break
+        if is_sequence(item):
+            if len(item) != 1 or is_sequence(item[0]):
+                raise ValueError(
+                    "Multi-dimensional features require a dataset-specific token adapter.")
             item = item[0]
         flattened.append(int(item))
     return flattened
@@ -711,7 +715,13 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
                     return tokenizer
             except (OSError, EOFError, AttributeError, KeyError, pickle.UnpicklingError):
                 pass
-    tokenizer.fit(train_graphs)
+    tokenizer.fit(
+        train_graphs,
+        graph_ids=[
+            getattr(graph, "graph_tokenizer_id", index)
+            for index, graph in enumerate(train_graphs)
+        ],
+    )
     if getattr(args, "protocol", None) == "paper":
         tokenizer._cache_status = "miss"
         tokenizer._cache_key = cache_key
@@ -1004,18 +1014,17 @@ def run_train_val_test(args):
     best_value = None
     best_epoch = None
     best_checkpoint_path = None
+    best_model_state = None
     stale_epochs = 0
     metric_name = primary_metric_name(spec)
     run_index = int(getattr(args, "run", 0))
     for epoch in range(1, args.n_epoch + 1):
         train_loss = train_one_epoch(model, train_one_step, encoded_splits["train"], spec, args)
         val_result = evaluate_split(model, encoded_splits["val"], spec, args)
-        test_result = evaluate_split(model, encoded_splits["test"], spec, args)
         entry = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val": val_result,
-            "test": test_result,
         }
         history.append(entry)
         val_metric = val_result["metrics"].get(metric_name, float("nan"))
@@ -1023,6 +1032,7 @@ def run_train_val_test(args):
             best_value = float(val_metric)
             best_epoch = epoch
             stale_epochs = 0
+            best_model_state = copy.deepcopy(model.state_dict())
             if args.save_checkpoint:
                 best_checkpoint_path = save_model_checkpoint(model, checkpoint_path(args, spec, run_index))
         else:
@@ -1031,6 +1041,10 @@ def run_train_val_test(args):
             break
 
     best = select_best_epoch(spec, history) or (history[-1] if history else None)
+    if best_model_state is None:
+        raise RuntimeError("No validation checkpoint was selected.")
+    model.load_state_dict(best_model_state)
+    best_test = evaluate_split(model, encoded_splits["test"], spec, args)
     return {
         "dataset": spec.canonical_name,
         "model": args.model,
@@ -1047,7 +1061,7 @@ def run_train_val_test(args):
         "pretrain": pretrain_summary,
         "checkpoint_path": best_checkpoint_path,
         "best_val": best["val"] if best else {},
-        "best_test": best["test"] if best else {},
+        "best_test": best_test,
         "history": history,
     }
 

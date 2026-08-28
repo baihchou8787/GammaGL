@@ -5,6 +5,7 @@ import gzip
 import sys
 import tempfile
 import types
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -493,6 +494,7 @@ def test_graph_tokenizer_trainer_loads_preprocessed_split_files():
     assert splits["train"][0].x == [0, 1]
     assert splits["train"][0].edge_attr == [0]
     assert splits["train"][0].y[:2] == [0.0, 0.0]
+    assert [graph.graph_tokenizer_id for graph in splits["train"]] == [0, 2]
 
 
 def test_graph_tokenizer_dataset_loader_bootstraps_repo_import_path(tmp_path, monkeypatch):
@@ -613,6 +615,65 @@ def test_graph_tokenizer_trainer_selects_best_epoch_by_metric_direction():
     assert trainer.select_best_epoch(molhiv, classification_history)["epoch"] == 3
 
 
+def test_graph_tokenizer_trainer_evaluates_test_once_after_restoring_best_val(monkeypatch, tmp_path):
+    trainer = _load_trainer_module()
+    spec = trainer.resolve_dataset_spec("qm9")
+    splits = {"train": [object()], "val": [object()], "test": [object()]}
+    encoded = {name: {"split": name} for name in splits}
+    calls = []
+
+    class Model:
+        trainable_weights = []
+
+        def __init__(self, **_kwargs):
+            self.loaded_state = None
+
+        def state_dict(self):
+            return {"epoch": len(calls)}
+
+        def load_state_dict(self, state):
+            self.loaded_state = state
+
+    model = Model()
+    fake_tlx = types.ModuleType("tensorlayerx")
+    fake_tlx.optimizers = SimpleNamespace(Adam=lambda **_kwargs: object())
+    fake_tlx_model = types.ModuleType("tensorlayerx.model")
+    fake_tlx_model.TrainOneStep = lambda *_args: object()
+    monkeypatch.setitem(sys.modules, "tensorlayerx", fake_tlx)
+    monkeypatch.setitem(sys.modules, "tensorlayerx.model", fake_tlx_model)
+    monkeypatch.setattr(trainer, "load_benchmark_splits", lambda *_args: splits)
+    monkeypatch.setattr(trainer, "fit_tokenizer", lambda *_args: object())
+    monkeypatch.setattr(trainer, "encode_graph_splits", lambda *_args, **_kwargs: encoded)
+    monkeypatch.setattr(trainer, "patch_tlx_torch_named_members", lambda: None)
+    monkeypatch.setattr(trainer, "load_model_class", lambda _name: lambda **_kwargs: model)
+    monkeypatch.setattr(trainer, "model_kwargs", lambda *_args: {})
+    monkeypatch.setattr(trainer, "run_mlm_pretrain", lambda *_args: {})
+    monkeypatch.setattr(trainer, "GraphTokenSupervisedLoss", lambda *_args: object())
+    monkeypatch.setattr(trainer, "train_one_epoch", lambda *_args: 0.0)
+
+    val_metrics = iter((0.4, 0.2, 0.3))
+
+    def evaluate(_model, encoded_split, _spec, _args):
+        split = encoded_split["split"]
+        calls.append(split)
+        metric = next(val_metrics) if split == "val" else 0.1
+        return {"loss": metric, "metrics": {"mae": metric}}
+
+    monkeypatch.setattr(trainer, "evaluate_split", evaluate)
+    args = SimpleNamespace(
+        dataset="qm9", seed=0, data_root=tmp_path, max_length=8, model="bert",
+        pretrain_epoch=0, lr=0.001, weight_decay=0.0, n_epoch=3, patience=0,
+        batch_size=1, save_checkpoint=False, run=0, output_dir=tmp_path,
+    )
+
+    summary = trainer.run_train_val_test(args)
+
+    assert calls == ["val", "val", "val", "test"]
+    assert model.loaded_state == {"epoch": 2}
+    assert all("test" not in entry for entry in summary["history"])
+    assert summary["best_test"]["metrics"] == {"mae": 0.1}
+
+
 def test_graph_tokenizer_trainer_iterates_token_batches_with_labels():
     trainer = _load_trainer_module()
 
@@ -639,6 +700,13 @@ def test_graph_tokenizer_trainer_iterates_token_batches_with_labels():
             "labels": [[0.3]],
         },
     ]
+
+
+def test_graph_tokenizer_trainer_rejects_multidimensional_features_without_adapter():
+    trainer = _load_trainer_module()
+
+    with pytest.raises(ValueError, match="dataset-specific token adapter"):
+        trainer.flatten_feature_ids([[1, 2], [1, 9]])
 
 
 def test_graph_tokenizer_trainer_formats_result_rows_and_aggregates_runs():

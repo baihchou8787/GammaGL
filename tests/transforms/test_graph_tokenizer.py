@@ -161,6 +161,14 @@ def test_feuler_rejects_graphs_that_cannot_be_an_undirected_simple_graph():
         FrequencyGuidedEulerianSerializer().fit([graph])
 
 
+def test_feuler_rejects_parallel_edges_instead_of_deduplicating_them():
+    FrequencyGuidedEulerianSerializer = _load_graph_serializer_module().FrequencyGuidedEulerianSerializer
+    graph = SimpleGraph(edge_index=[[0, 0], [1, 1]], x=[4, 5], edge_attr=[1, 1])
+
+    with pytest.raises(ValueError, match="Parallel edges"):
+        FrequencyGuidedEulerianSerializer().fit([graph])
+
+
 def test_serializer_preserves_preencoded_paper_node_and_edge_tokens():
     graph_serializer = _load_graph_serializer_module()
     graph = SimpleGraph(edge_index=[[0], [1]], x=[13, 17], edge_attr=[2])
@@ -192,6 +200,16 @@ def test_graph_bpe_trains_most_frequent_pairs_and_encodes_sequences():
     assert bpe.codebook.vocab_size == 8
     assert bpe.encode([1, 2, 1, 2, 3]) == [7, 3]
     assert bpe.batch_encode([[1, 2], [4, 5]]) == [[6], [4, 5]]
+
+
+def test_graph_bpe_never_merges_pairs_touching_protected_tokens():
+    GraphBPE = _load_graph_bpe_module().GraphBPE
+
+    bpe = GraphBPE(num_merges=2, min_frequency=2, protected_token_ids={7})
+    bpe.fit([[10, 7, 11], [10, 7, 11]])
+
+    assert bpe.codebook.merge_rules == []
+    assert bpe.encode([10, 7, 11]) == [10, 7, 11]
 
 
 def test_graph_bpe_respects_min_frequency_and_roundtrips_codebook(tmp_path):
@@ -343,6 +361,20 @@ def test_graph_tokenizer_fits_serializer_and_bpe_then_encodes_graph():
     assert encoding.metadata["serializer"]["method"] == "feuler"
 
 
+def test_graph_tokenizer_protects_component_separator_from_bpe_merges():
+    graph_tokenizer = _load_graph_tokenizer_module()
+    graph_bpe = _load_graph_bpe_module()
+    graph = SimpleGraph(
+        edge_index=[[0, 2], [1, 3]], x=[1, 2, 1, 2], edge_attr=[5, 5])
+    tokenizer = graph_tokenizer.GraphTokenizer(
+        bpe=graph_bpe.GraphBPE(num_merges=8, min_frequency=2))
+
+    tokenizer.fit([graph, graph])
+
+    separator = tokenizer.special_tokens.component_sep_token_id
+    assert all(separator not in rule[:2] for rule in tokenizer.bpe.codebook.merge_rules)
+
+
 def test_graph_tokenizer_rejects_empty_training_corpus_and_unfitted_encoding():
     graph_tokenizer = _load_graph_tokenizer_module()
     graph_bpe = _load_graph_bpe_module()
@@ -353,6 +385,20 @@ def test_graph_tokenizer_rejects_empty_training_corpus_and_unfitted_encoding():
         tokenizer.fit([])
     with pytest.raises(RuntimeError, match="must be fit"):
         tokenizer.encode_graph(graph)
+
+
+def test_graph_tokenizer_records_train_only_fit_provenance():
+    graph_tokenizer = _load_graph_tokenizer_module()
+    graph_bpe = _load_graph_bpe_module()
+    graph = SimpleGraph(edge_index=[[0], [1]], x=[1, 2], edge_attr=[5])
+    tokenizer = graph_tokenizer.GraphTokenizer(bpe=graph_bpe.GraphBPE(num_merges=0))
+
+    tokenizer.fit([graph], graph_ids=[42])
+    encoding = tokenizer.encode_graph(graph)
+
+    assert tokenizer.fit_graph_ids_hash
+    assert encoding.metadata["tokenizer_schema_version"] == 1
+    assert encoding.metadata["fit_graph_ids_hash"] == tokenizer.fit_graph_ids_hash
 
 
 def test_graph_tokenizer_batch_encodes_serialized_graphs_together(monkeypatch):
