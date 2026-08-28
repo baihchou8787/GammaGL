@@ -252,15 +252,15 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
 
 The paper reports the following five-run mean results:
 
-| Dataset | Encoder | Metric | Paper | Our |
+| Dataset | Encoder | Metric | Paper | GammaGL status |
 | --- | --- | --- | ---: | --- |
-| QM9 | BERT | MAE ↓ | 0.122 | **0.098260 ± 0.001485** |
-| QM9 | GTE | MAE ↓ | 0.071 | **0.072683 ± 0.002879** |
-| OGBG-molhiv | BERT | ROC-AUC ↑ | 82.6 | **0.752304 ± 0.012068** |
-| OGBG-molhiv | GTE | ROC-AUC ↑ | 87.4 | **0.751194 ± 0.013487** |
-| Peptides-struct | BERT | Average MAE ↓ | 0.247 | **0.271649 ± 0.002354** |
-| Peptides-struct | GTE | Average MAE ↓ | 0.242 | **0.271396 ± 0.002603** |
+| QM9 | BERT | raw MAE ↓ | 0.122 | revalidation required |
+| QM9 | GTE | raw MAE ↓ | 0.071 | revalidation required: official weights |
+| OGBG-molhiv | BERT | ROC-AUC ↑ | 82.6% | revalidation required |
+| OGBG-molhiv | GTE | ROC-AUC ↑ | 87.4% | revalidation required: official weights |
+| Peptides-struct | BERT | Average MAE ↓ | 0.247 | revalidation required |
+| Peptides-struct | GTE | Average MAE ↓ | 0.242 | revalidation required: official weights |
 
-`Paper` is the value reported by the GraphTokenizer paper. `Our` means the result reproduced by this GammaGL implementation with the matching command above; use the test mean and population standard deviation from the generated summary rather than substituting a single run.
+`Paper` is the value reported by the GraphTokenizer paper. GammaGL results must not be compared or described as reproduced until the strict run records the official GTE checkpoint provenance and reports QM9 in raw label units.
 
 Each run keeps result artifacts under `--output-dir`, including the summary JSON, per-run CSV, Markdown/LaTeX paper tables, runtime manifest, checkpoints, and paper-protocol state. JSON remains an output format only; it is not used as an input parameter configuration.

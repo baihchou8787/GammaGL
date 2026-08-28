@@ -12,7 +12,12 @@ class GraphSerializationResult:
 
 
 class FrequencyGuidedEulerianSerializer:
-    """Minimal public interface for the paper's default Feuler serializer."""
+    """Paper Feuler serializer for undirected simple graphs only.
+
+    ``edge_index`` may contain one or both directions of an undirected edge,
+    but every direction must carry the same edge label. Directed graphs,
+    parallel edges, and self-loops are not representable by this serializer.
+    """
 
     def __init__(
         self,
@@ -63,14 +68,8 @@ class FrequencyGuidedEulerianSerializer:
             },
         )
 
-    def deserialize(self, result: GraphSerializationResult) -> Dict[str, List[int]]:
-        """Rebuild the labeled graph recorded by :meth:`serialize`.
-
-        The paper serializer's token stream is consumed by BPE, so it does not
-        reserve extra structural symbols solely for decoding.  The traversal
-        metadata retained in ``GraphSerializationResult`` provides an exact
-        round-trip validation path without changing that stream.
-        """
+    def restore_input_metadata(self, result: GraphSerializationResult) -> Dict[str, List[int]]:
+        """Return input metadata; this is not a token-stream decoder."""
         metadata = result.metadata
         if "node_labels" not in metadata or "input_edges" not in metadata:
             raise ValueError("Serialization result does not contain round-trip metadata.")
@@ -83,6 +82,12 @@ class FrequencyGuidedEulerianSerializer:
             "x": [int(label) for label in metadata["node_labels"]],
             "edge_attr": [label for _, _, label in input_edges],
         }
+
+    def deserialize(self, result: GraphSerializationResult) -> Dict[str, List[int]]:
+        """Reject ambiguous use as a token-stream decoder."""
+        raise NotImplementedError(
+            "Feuler token streams are not self-describing; use "
+            "restore_input_metadata() for metadata validation.")
 
     @staticmethod
     def node_token(label: int) -> int:
@@ -102,6 +107,7 @@ class FrequencyGuidedEulerianSerializer:
         node_labels = self._node_labels(self._get_graph_attr(graph, "x"), num_nodes)
         edge_labels = self._edge_labels(self._get_graph_attr(graph, "edge_attr"), len(edge_pairs))
         input_edges = [(int(src), int(dst), int(edge_labels[i])) for i, (src, dst) in enumerate(edge_pairs)]
+        self._validate_undirected_simple(input_edges)
         arcs = self._undirected_arcs(input_edges)
         return {
             "num_nodes": num_nodes,
@@ -109,6 +115,19 @@ class FrequencyGuidedEulerianSerializer:
             "input_edges": input_edges,
             "arcs": arcs,
         }
+
+    @staticmethod
+    def _validate_undirected_simple(input_edges: Sequence[Tuple[int, int, int]]) -> None:
+        labels_by_edge: Dict[Tuple[int, int], int] = {}
+        for src, dst, label in input_edges:
+            if src == dst:
+                raise ValueError("Feuler does not support self-loops.")
+            key = (min(src, dst), max(src, dst))
+            previous = labels_by_edge.setdefault(key, label)
+            if previous != label:
+                raise ValueError(
+                    "Feuler only supports undirected simple graphs; "
+                    f"edge {key} has conflicting labels {previous} and {label}.")
 
     @staticmethod
     def _get_graph_attr(graph: Any, name: str):

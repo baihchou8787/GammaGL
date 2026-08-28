@@ -1,6 +1,5 @@
 ﻿import argparse
 import csv
-import gzip
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -123,58 +122,6 @@ def effective_seed(seed: Optional[int]) -> int:
     return 0 if seed is None else int(seed)
 
 
-def pad_token_sequences(
-    sequences: Sequence[Sequence[int]],
-    max_length: int,
-    pad_token_id: int,
-) -> Tuple[List[List[int]], List[List[int]]]:
-    input_ids: List[List[int]] = []
-    attention_mask: List[List[int]] = []
-    for sequence in sequences:
-        clipped = [int(token) for token in sequence[:max_length]]
-        mask = [1] * len(clipped)
-        padding = max_length - len(clipped)
-        input_ids.append(clipped + [int(pad_token_id)] * padding)
-        attention_mask.append(mask + [0] * padding)
-    return input_ids, attention_mask
-
-
-def apply_mlm_mask(
-    input_ids: Sequence[Sequence[int]],
-    mask_token_id: int,
-    special_token_ids: Set[int],
-    mask_prob: float = 0.15,
-    seed: int = 0,
-) -> Tuple[List[List[int]], List[List[int]]]:
-    rng = random.Random(seed)
-    masked_ids: List[List[int]] = []
-    labels: List[List[int]] = []
-    for sequence in input_ids:
-        masked_sequence = []
-        label_sequence = []
-        for token in sequence:
-            token = int(token)
-            if token in special_token_ids or rng.random() >= mask_prob:
-                masked_sequence.append(token)
-                label_sequence.append(-100)
-            else:
-                masked_sequence.append(int(mask_token_id))
-                label_sequence.append(token)
-        masked_ids.append(masked_sequence)
-        labels.append(label_sequence)
-    if (
-            float(mask_prob) > 0
-            and not any(label != -100 for row in labels for label in row)):
-        for row_index, sequence in enumerate(input_ids):
-            for column_index, token in enumerate(sequence):
-                token = int(token)
-                if token not in special_token_ids:
-                    masked_ids[row_index][column_index] = int(mask_token_id)
-                    labels[row_index][column_index] = token
-                    return masked_ids, labels
-    return masked_ids, labels
-
-
 def make_synthetic_graphs(spec: DatasetSpec) -> List[SyntheticGraph]:
     targets = synthetic_targets(spec)
     return [
@@ -199,16 +146,8 @@ def synthetic_targets(spec: DatasetSpec) -> List[List[float]]:
 
 def load_benchmark_splits(data_root, spec: DatasetSpec) -> Dict[str, List[SyntheticGraph]]:
     dataset = load_gammagl_benchmark_dataset(data_root, spec)
-    if dataset is not None:
-        graphs = [gammagl_graph_to_synthetic_graph(dataset[index], spec) for index in range(len(dataset))]
-        return select_strict_splits(graphs, dataset.get_idx_split())
-
-    dataset_dir = find_dataset_dir(Path(data_root), spec)
-    data_file = find_data_file(dataset_dir)
-    raw_samples = read_pickle_data(data_file)
-    split_indices = read_split_indices(dataset_dir)
-    graphs = [sample_to_synthetic_graph(sample, spec, index) for index, sample in enumerate(raw_samples)]
-    return select_strict_splits(graphs, split_indices)
+    graphs = [gammagl_graph_to_synthetic_graph(dataset[index], spec) for index in range(len(dataset))]
+    return select_strict_splits(graphs, dataset.get_idx_split())
 
 
 def load_gammagl_benchmark_dataset(data_root, spec: DatasetSpec):
@@ -219,24 +158,12 @@ def load_gammagl_benchmark_dataset(data_root, spec: DatasetSpec):
         "peptides-struct": "PeptidesStruct",
     }.get(spec.canonical_name)
     if dataset_cls is None:
-        return None
-
-    root = Path(data_root)
-    canonical_dirname = {
-        "qm9": "qm9",
-        "molhiv": "ogbg-molhiv",
-        "peptides-struct": "peptides-struct",
-    }[spec.canonical_name]
-    canonical_dir = root / canonical_dirname
-    if (canonical_dir / "raw").exists() or (canonical_dir / "processed").exists():
-        from gammagl import datasets as gammagl_datasets
-        return getattr(gammagl_datasets, dataset_cls)(root=str(root))
-    for dirname in spec.data_dir_names:
-        if (root / dirname).exists():
-            return None
+        raise ValueError(
+            "GammaGL GraphTokenizer benchmarks support QM9, OGBG-molhiv, "
+            "and Peptides-struct only.")
 
     from gammagl import datasets as gammagl_datasets
-    return getattr(gammagl_datasets, dataset_cls)(root=str(root))
+    return getattr(gammagl_datasets, dataset_cls)(root=str(data_root))
 
 
 def validate_split_indices(num_samples: int, split_indices: Dict[str, List[int]]) -> None:
@@ -276,161 +203,6 @@ def gammagl_graph_to_synthetic_graph(graph, spec: DatasetSpec) -> SyntheticGraph
     )
 
 
-def find_dataset_dir(data_root: Path, spec: DatasetSpec) -> Path:
-    candidates = spec.data_dir_names or (spec.canonical_name,)
-    for name in candidates:
-        path = data_root / name
-        if path.exists():
-            return path
-    candidate_text = ", ".join(str(data_root / name) for name in candidates)
-    raise FileNotFoundError(f"Dataset directory not found. Checked: {candidate_text}")
-
-
-def find_data_file(dataset_dir: Path) -> Path:
-    for filename in ("data.pkl", "data.pkl.gz"):
-        path = dataset_dir / filename
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"Expected data.pkl or data.pkl.gz under {dataset_dir}")
-
-
-def find_data_storage_dir(dataset_dir: Path) -> Path:
-    if (dataset_dir / "raw").exists():
-        try:
-            find_data_file(dataset_dir / "raw")
-            return dataset_dir / "raw"
-        except FileNotFoundError:
-            pass
-    return dataset_dir
-
-
-def read_pickle_data(data_file: Path):
-    opener = gzip.open if data_file.suffix == ".gz" else open
-    with opener(data_file, "rb") as handle:
-        return pickle.load(handle)
-
-
-def read_split_indices(dataset_dir: Path) -> Dict[str, List[int]]:
-    splits: Dict[str, List[int]] = {}
-    for split_name in ("train", "val", "test"):
-        path = dataset_dir / f"{split_name}_index.json"
-        if not path.exists():
-            raise FileNotFoundError(f"Split file not found: {path}")
-        with path.open("r", encoding="utf-8") as handle:
-            splits[split_name] = [int(index) for index in json.load(handle)]
-    return splits
-
-
-def sample_to_synthetic_graph(sample, spec: DatasetSpec, index: int) -> SyntheticGraph:
-    if isinstance(sample, dict):
-        graph_data = sample
-        label_data = sample.get("properties", sample.get("y", sample.get("label", sample.get("labels"))))
-    elif isinstance(sample, tuple) and len(sample) >= 2:
-        graph_data, label_data = sample[0], sample[1]
-    else:
-        raise ValueError(f"Unsupported sample format at index {index}: {type(sample)!r}")
-
-    edge_index, x, edge_attr = graph_to_fields(graph_data)
-    label = extract_label(label_data, spec)
-    return SyntheticGraph(edge_index=edge_index, x=x, edge_attr=edge_attr, y=label)
-
-
-def graph_to_fields(graph_data) -> Tuple[List[List[int]], List[int], List[int]]:
-    if isinstance(graph_data, dict):
-        edge_index = graph_data.get("edge_index")
-        if edge_index is None and "edges" in graph_data:
-            edge_index = graph_data["edges"]
-        node_name, x = first_present_field(
-            graph_data,
-            ("node_token_ids", "node_type_ids", "x", "node_features", "node_feat", "attr", "node_labels"),
-        )
-        edge_name, edge_attr = first_present_field(
-            graph_data,
-            ("edge_token_ids", "edge_type_ids", "edge_attr", "edge_features", "edge_feat", "edge_labels"),
-        )
-        if x is None or edge_attr is None:
-            raise ValueError("Graph data must include paper node and edge features.")
-        return (
-            normalize_edge_index(edge_index),
-            encode_paper_feature_ids(node_name, x, is_edge=False),
-            encode_paper_feature_ids(edge_name, edge_attr, is_edge=True),
-        )
-
-    if hasattr(graph_data, "edges"):
-        src, dst = graph_data.edges()
-        edge_index = [to_list(src), to_list(dst)]
-        node_data = getattr(graph_data, "ndata", {})
-        edge_data = getattr(graph_data, "edata", {})
-        node_name, x = first_present_field(node_data, ("node_token_ids", "node_type_id", "x", "attr"))
-        edge_name, edge_attr = first_present_field(edge_data, ("edge_token_ids", "edge_type_id", "edge_attr"))
-        if x is None or edge_attr is None:
-            raise ValueError("DGL graph must include paper node and edge features.")
-        return (
-            normalize_edge_index(edge_index),
-            encode_paper_feature_ids(node_name, x, is_edge=False),
-            encode_paper_feature_ids(edge_name, edge_attr, is_edge=True),
-        )
-
-    raise ValueError(f"Unsupported graph object: {type(graph_data)!r}")
-
-
-def first_present(mapping, names: Sequence[str]):
-    for name in names:
-        if name in mapping:
-            return mapping[name]
-    return None
-
-
-def first_present_field(mapping, names: Sequence[str]):
-    for name in names:
-        if name in mapping:
-            return name, mapping[name]
-    return None, None
-
-
-def encode_paper_feature_ids(field_name: str, values, is_edge: bool) -> List[int]:
-    values = to_list(values)
-    if not is_sequence(values):
-        raise ValueError(f"{field_name} must be a sequence of feature values.")
-    if field_name.endswith("_token_ids"):
-        return [scalar_token_id(field_name, value) for value in values]
-
-    encoded = []
-    for position, value in enumerate(values):
-        raw_type = extract_paper_feature_type(field_name, value, is_edge)
-        if raw_type < 0:
-            raise ValueError(f"{field_name}[{position}] must be non-negative.")
-        encoded.append(2 * raw_type if is_edge else 2 * raw_type + 1)
-    return encoded
-
-
-def scalar_token_id(field_name: str, value) -> int:
-    value = to_list(value)
-    if is_sequence(value):
-        if len(value) != 1 or is_sequence(value[0]):
-            raise ValueError(f"{field_name} must contain one scalar token per item.")
-        value = value[0]
-    token_id = int(value)
-    if token_id < 0:
-        raise ValueError(f"{field_name} token IDs must be non-negative.")
-    return token_id
-
-
-def extract_paper_feature_type(field_name: str, value, is_edge: bool) -> int:
-    value = to_list(value)
-    if not is_sequence(value):
-        return int(value)
-    if not value:
-        raise ValueError(f"{field_name} contains an empty feature row.")
-    numeric = [float(item) for item in value]
-    if is_edge and all(item in (0.0, 1.0) for item in numeric) and sum(numeric) == 1.0:
-        return numeric.index(1.0) + 1
-    column = 5 if field_name == "attr" and not is_edge else 0
-    if column >= len(value):
-        raise ValueError(f"{field_name} requires feature column {column}.")
-    return int(value[column])
-
-
 def normalize_edge_index(edge_index) -> List[List[int]]:
     if edge_index is None:
         return [[], []]
@@ -455,27 +227,6 @@ def flatten_feature_ids(values) -> List[int]:
             item = item[0]
         flattened.append(int(item))
     return flattened
-
-
-def extract_label(label_data, spec: DatasetSpec) -> List[float]:
-    if isinstance(label_data, dict):
-        if spec.label_keys == ("labels",):
-            if "labels" not in label_data:
-                raise ValueError("Label mapping is missing required 'labels' field.")
-            return as_float_list(label_data["labels"], spec.output_dim, allow_nan=True)
-        missing = [key for key in spec.label_keys if key not in label_data]
-        if missing:
-            if spec.canonical_name == "qm9":
-                raise ValueError(
-                    "QM9 sample must provide exactly 16 QM9 properties; "
-                    f"missing: {', '.join(missing)}.")
-            raise ValueError(f"Label mapping is missing required fields: {', '.join(missing)}.")
-        return as_float_list([label_data[key] for key in spec.label_keys], spec.output_dim)
-    return as_float_list(
-        label_data,
-        spec.output_dim,
-        allow_nan=spec.canonical_name == "peptides-struct",
-    )
 
 
 def as_float_list(value, output_dim: int, allow_nan: bool = False) -> List[float]:
@@ -980,11 +731,8 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
 
 def encode_graph_batch(graphs: Sequence[SyntheticGraph], tokenizer, max_length: int) -> Dict[str, List[List[float]]]:
     encoded = [tokenizer.encode_graph(graph).input_ids for graph in graphs]
-    input_ids, attention_mask = pad_token_sequences(
-        encoded,
-        max_length=max_length,
-        pad_token_id=tokenizer.special_tokens.pad_token_id,
-    )
+    input_ids, attention_mask = tokenizer.pad_token_sequences(
+        encoded, max_length=max_length)
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
@@ -1017,15 +765,12 @@ def iter_token_batches(encoded_split: Dict[str, List[List[float]]], batch_size: 
 
 def build_mlm_pretrain_split(
     encoded_split: Dict[str, List[List[float]]],
-    mask_token_id: int,
-    special_token_ids: Set[int],
+    tokenizer,
     mask_prob: float,
     seed: int,
 ) -> Dict[str, List[List[int]]]:
-    masked_ids, mlm_labels = apply_mlm_mask(
+    masked_ids, mlm_labels = tokenizer.mask_token_sequences(
         encoded_split["input_ids"],
-        mask_token_id=mask_token_id,
-        special_token_ids=special_token_ids,
         mask_prob=mask_prob,
         seed=seed,
     )
@@ -1189,8 +934,7 @@ def run_mlm_pretrain(model, encoded_train, tokenizer, args) -> Dict[str, Any]:
         model.set_train()
         masked_train = build_mlm_pretrain_split(
             encoded_train,
-            mask_token_id=special_tokens.mask_token_id,
-            special_token_ids=special_token_ids,
+            tokenizer=tokenizer,
             mask_prob=args.mask_prob,
             seed=effective_seed(args.seed) + epoch,
         )
@@ -1239,7 +983,9 @@ def run_train_val_test(args):
     spec = resolve_dataset_spec(args.dataset)
     random.seed(effective_seed(args.seed))
     splits = load_benchmark_splits(args.data_root, spec)
-    train_graphs = splits["train"] or (splits["val"] + splits["test"])
+    train_graphs = splits["train"]
+    if not train_graphs:
+        raise ValueError("GraphTokenizer training split cannot be empty.")
     tokenizer = fit_tokenizer(args, train_graphs)
     encoded_splits = encode_graph_splits(splits, tokenizer, max_length=args.max_length)
 
@@ -1409,42 +1155,18 @@ def preflight_dataset_status(data_root, dataset: str) -> Dict[str, Any]:
         "status": "ok",
     }
     gammagl_dataset = load_gammagl_benchmark_dataset(data_root, spec)
-    if gammagl_dataset is not None:
-        split_indices = gammagl_dataset.get_idx_split()
-        validate_split_indices(len(gammagl_dataset), split_indices)
-        dataset_dir = Path(gammagl_dataset.root_dir)
-        storage_dir = Path(gammagl_dataset.raw_dir)
-        data_file = find_data_file(storage_dir)
-        status.update(
-            {
-                "dataset_dir": str(dataset_dir),
-                "data_file": str(data_file),
-                "storage_dir": str(storage_dir),
-                "num_samples": len(gammagl_dataset),
-                "split_sizes": {
-                    split_name: len(indices)
-                    for split_name, indices in split_indices.items()
-                },
-                "downloaded_by_dataset": True,
-            }
-        )
-        return status
-
-    dataset_dir = find_dataset_dir(Path(data_root), spec)
-    storage_dir = find_data_storage_dir(dataset_dir)
-    data_file = find_data_file(storage_dir)
-    split_indices = read_split_indices(storage_dir)
-    raw_samples = read_pickle_data(data_file)
-    graphs = [sample_to_synthetic_graph(sample, spec, index)
-              for index, sample in enumerate(raw_samples)]
-    select_strict_splits(graphs, split_indices)
+    if gammagl_dataset is None:
+        raise FileNotFoundError(
+            f"GammaGL dataset loader could not materialize {spec.paper_name}.")
+    split_indices = gammagl_dataset.get_idx_split()
+    validate_split_indices(len(gammagl_dataset), split_indices)
     status.update(
         {
-            "dataset_dir": str(dataset_dir),
-            "data_file": str(data_file),
-            "storage_dir": str(storage_dir),
-            "num_samples": len(graphs),
+            "dataset_dir": str(gammagl_dataset.root_dir),
+            "storage_dir": str(gammagl_dataset.raw_dir),
+            "num_samples": len(gammagl_dataset),
             "split_sizes": {split_name: len(indices) for split_name, indices in split_indices.items()},
+            "downloaded_by_dataset": True,
         }
     )
     return status
@@ -1456,7 +1178,15 @@ def preflight_model_status(model: str) -> Dict[str, Any]:
     model_path = repo_root() / "gammagl" / "models" / filename
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    return {"model": model_name, "status": "ok", "file": str(model_path)}
+    status = {"model": model_name, "status": "ok", "file": str(model_path)}
+    if model_name == "gte":
+        status.update({
+            "reproduction_ready": False,
+            "reason": (
+                "GraphGTE is randomly initialized; official "
+                "Alibaba-NLP/gte-multilingual-base loading is not implemented."),
+        })
+    return status
 
 
 def preflight_bpe_backend_status(backend: str) -> Dict[str, Any]:
@@ -1804,22 +1534,15 @@ def run_smoke(args):
     graphs = load_graphs(args, spec)
     tokenizer = fit_tokenizer(args, graphs)
     encoded = [tokenizer.encode_graph(graph).input_ids for graph in graphs]
-    input_ids, attention_mask = pad_token_sequences(
+    mlm_batch = tokenizer.build_mlm_batch_from_token_sequences(
         encoded,
         max_length=args.max_length,
-        pad_token_id=tokenizer.special_tokens.pad_token_id,
-    )
-    masked_ids, mlm_labels = apply_mlm_mask(
-        input_ids,
-        mask_token_id=tokenizer.special_tokens.mask_token_id,
-        special_token_ids={
-            tokenizer.special_tokens.pad_token_id,
-            tokenizer.special_tokens.cls_token_id,
-            tokenizer.special_tokens.sep_token_id,
-        },
         mask_prob=args.mask_prob,
         seed=effective_seed(args.seed),
     )
+    masked_ids = mlm_batch.input_ids
+    attention_mask = mlm_batch.attention_mask
+    mlm_labels = mlm_batch.labels
 
     patch_tlx_torch_named_members()
     import tensorlayerx as tlx

@@ -137,17 +137,28 @@ def test_feuler_serializes_long_graph_without_python_recursion():
     assert len(result.token_ids) == num_edges * 4 + 1
 
 
-def test_feuler_round_trips_input_graph_through_serialization_metadata():
+def test_feuler_only_restores_input_graph_from_serialization_metadata():
     FrequencyGuidedEulerianSerializer = _load_graph_serializer_module().FrequencyGuidedEulerianSerializer
 
     graph = SimpleGraph(edge_index=[[0, 1], [1, 2]], x=[4, 5, 6], edge_attr=[1, 2])
     serializer = FrequencyGuidedEulerianSerializer().fit([graph])
 
-    restored = serializer.deserialize(serializer.serialize(graph))
+    result = serializer.serialize(graph)
+    restored = serializer.restore_input_metadata(result)
 
     assert restored["edge_index"] == [[0, 1], [1, 2]]
     assert restored["x"] == [4, 5, 6]
     assert restored["edge_attr"] == [1, 2]
+    with pytest.raises(NotImplementedError, match="not self-describing"):
+        serializer.deserialize(result)
+
+
+def test_feuler_rejects_graphs_that_cannot_be_an_undirected_simple_graph():
+    FrequencyGuidedEulerianSerializer = _load_graph_serializer_module().FrequencyGuidedEulerianSerializer
+    graph = SimpleGraph(edge_index=[[0, 1], [1, 0]], x=[4, 5], edge_attr=[1, 2])
+
+    with pytest.raises(ValueError, match="undirected simple"):
+        FrequencyGuidedEulerianSerializer().fit([graph])
 
 
 def test_serializer_preserves_preencoded_paper_node_and_edge_tokens():
@@ -214,8 +225,48 @@ def test_graph_bpe_auto_backend_matches_python_fallback():
     assert auto_bpe.encode([1, 2, 1, 2, 3]) == python_bpe.encode([1, 2, 1, 2, 3])
 
 
-def test_graph_bpe_cpp_package_exposes_python_compatible_bridge():
+def test_graph_bpe_auto_falls_back_without_the_native_bridge(monkeypatch):
+    GraphBPE = _load_graph_bpe_module().GraphBPE
     from third_party import graph_bpe_cpp
+
+    monkeypatch.setattr(graph_bpe_cpp, "is_available", lambda: False)
+    monkeypatch.setattr(
+        graph_bpe_cpp,
+        "train_bpe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("native bridge used")),
+    )
+
+    bpe = GraphBPE(num_merges=1, min_frequency=2, backend="auto").fit(
+        [[1, 2], [1, 2]])
+
+    assert bpe.codebook.merge_rules == [(1, 2, 3)]
+    assert bpe.codebook.metadata["backend"] == "python"
+
+
+def test_graph_bpe_cpp_requires_the_native_bridge(monkeypatch):
+    GraphBPE = _load_graph_bpe_module().GraphBPE
+    from third_party import graph_bpe_cpp
+
+    monkeypatch.setattr(graph_bpe_cpp, "is_available", lambda: False)
+
+    bpe = GraphBPE(num_merges=1, min_frequency=2, backend="cpp")
+    with pytest.raises(ImportError, match="native extension"):
+        bpe.fit([[1, 2], [1, 2]])
+
+    bpe.codebook.merge_rules = [(1, 2, 3)]
+    with pytest.raises(ImportError, match="native extension"):
+        bpe.encode([1, 2])
+    with pytest.raises(ImportError, match="native extension"):
+        bpe.batch_encode([[1, 2]])
+
+
+def test_graph_bpe_cpp_package_exposes_native_results_when_available():
+    from third_party import graph_bpe_cpp
+
+    if not graph_bpe_cpp.is_available():
+        with pytest.raises(ImportError, match="native extension"):
+            graph_bpe_cpp.train_bpe([[1, 2]], num_merges=1, min_frequency=2)
+        return
 
     result = graph_bpe_cpp.train_bpe(
         [[1, 2, 1, 2], [1, 2, 1, 2], [1, 2, 3]],
@@ -354,6 +405,17 @@ def test_graph_tokenizer_builds_mlm_pretraining_batch():
     assert tokenizer.special_tokens.mask_token_id in sequence
     assert sum(1 for value in labels if value != -100) > 0
     assert batch.metadata["num_mlm_labels"] == sum(1 for value in labels if value != -100)
+
+
+def test_graph_tokenizer_builds_mlm_batch_from_token_sequences():
+    tokenizer = _load_graph_tokenizer_module().GraphTokenizer()
+
+    batch = tokenizer.build_mlm_batch_from_token_sequences(
+        [[3, 6, 4], [3, 8, 9, 4]], max_length=5, mask_prob=1.0, seed=7)
+
+    assert batch.input_ids == [[3, 2, 4, 0, 0], [3, 2, 2, 4, 0]]
+    assert batch.attention_mask == [[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]]
+    assert batch.labels == [[-100, 6, -100, -100, -100], [-100, 8, 9, -100, -100]]
 
 
 def test_graph_tokenizer_mlm_forces_one_mask_when_random_draw_selects_none():

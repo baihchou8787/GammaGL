@@ -538,8 +538,8 @@ def test_qm9_evaluation_uses_standardized_mae_and_keeps_raw_diagnostics():
         normalizer={"mean": [100.0, 1000.0], "std": [10.0, 100.0]},
     )
 
-    assert result["metric"] == 1.0
-    assert result["metric_space"] == "train_standardized"
+    assert result["metric"] == 55.0
+    assert result["metric_space"] == "raw"
     assert result["per_target_mae"] == {"first": 1.0, "second": 1.0}
     assert result["per_target_mae_raw"] == {"first": 10.0, "second": 100.0}
 

@@ -218,7 +218,12 @@ class GraphGTELayer(tlx.nn.Module):
 
 
 class GraphGTE(tlx.nn.Module):
-    """Strict GTE-Base GraphTokenizer encoder implemented with TLX APIs."""
+    """Randomly initialized GTE-shaped GraphTokenizer encoder.
+
+    This native TLX model is not an Alibaba GTE checkpoint loader. Its
+    manifest records that distinction so it cannot be reported as an
+    official-GTE reproduction.
+    """
 
     encoder_type = "gte"
     model_name = "gte-base"
@@ -380,4 +385,6 @@ class GraphGTE(tlx.nn.Module):
                 "factor": self.rope_scaling_factor,
             },
             "framework": "tensorlayerx",
+            "weight_source": "random_initialization",
+            "official_checkpoint": None,
         }

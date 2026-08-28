@@ -178,13 +178,39 @@ class GraphTokenizer(BaseTransform):
         mask_prob: float = 0.15,
         seed: int = 0,
     ) -> GraphTokenizerMLMBatch:
-        input_ids = [self.encode_graph(graph).input_ids[:max_length] for graph in graphs]
-        attention_mask = [[1] * len(sequence) + [0] * (max_length - len(sequence)) for sequence in input_ids]
+        return self.build_mlm_batch_from_token_sequences(
+            [self.encode_graph(graph).input_ids for graph in graphs],
+            max_length=max_length,
+            mask_prob=mask_prob,
+            seed=seed,
+        )
+
+    def pad_token_sequences(self, token_sequences, max_length: int):
+        input_ids = [
+            [int(token) for token in sequence[:max_length]]
+            for sequence in token_sequences
+        ]
+        attention_mask = [
+            [1] * len(sequence) + [0] * (max_length - len(sequence))
+            for sequence in input_ids
+        ]
         padded_ids = [
             sequence + [self.special_tokens.pad_token_id] * (max_length - len(sequence))
             for sequence in input_ids
         ]
-        masked_ids, labels = self._mask_input_ids(padded_ids, mask_prob=mask_prob, seed=seed)
+        return padded_ids, attention_mask
+
+    def build_mlm_batch_from_token_sequences(
+        self,
+        token_sequences,
+        max_length: int,
+        mask_prob: float = 0.15,
+        seed: int = 0,
+    ) -> GraphTokenizerMLMBatch:
+        padded_ids, attention_mask = self.pad_token_sequences(
+            token_sequences, max_length=max_length)
+        masked_ids, labels = self.mask_token_sequences(
+            padded_ids, mask_prob=mask_prob, seed=seed)
         num_mlm_labels = sum(1 for row in labels for value in row if value != -100)
         return GraphTokenizerMLMBatch(
             input_ids=masked_ids,
@@ -198,7 +224,8 @@ class GraphTokenizer(BaseTransform):
             },
         )
 
-    def _mask_input_ids(self, input_ids: List[List[int]], mask_prob: float, seed: int):
+    def mask_token_sequences(
+        self, input_ids: List[List[int]], mask_prob: float, seed: int):
         rng = random.Random(seed)
         special_ids = {
             self.special_tokens.pad_token_id,
@@ -233,6 +260,9 @@ class GraphTokenizer(BaseTransform):
                         labels[row_index][column_index] = token
                         return masked_ids, labels
         return masked_ids, labels
+
+    def _mask_input_ids(self, input_ids: List[List[int]], mask_prob: float, seed: int):
+        return self.mask_token_sequences(input_ids, mask_prob=mask_prob, seed=seed)
 
     def __call__(self, data: Any):
         encoding = self.encode_graph(data)

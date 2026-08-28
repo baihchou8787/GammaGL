@@ -27,11 +27,18 @@ class GraphBPE:
         self.codebook = BPECodebook()
 
     def fit(self, token_sequences):
-        if self.backend in {"auto", "cpp"}:
+        if self.backend == "cpp":
             return self._fit_with_bridge(token_sequences)
-        if self.backend != "python":
+        if self.backend == "auto":
+            from third_party import graph_bpe_cpp
+            if graph_bpe_cpp.is_available():
+                return self._fit_with_bridge(token_sequences)
+        elif self.backend != "python":
             raise ValueError("backend must be one of: python, auto, cpp.")
 
+        return self._fit_python(token_sequences)
+
+    def _fit_python(self, token_sequences):
         sequences = [self._as_int_list(sequence) for sequence in token_sequences]
         merge_rules: List[MergeRule] = []
         next_token_id = self._next_token_id(sequences)
@@ -63,27 +70,31 @@ class GraphBPE:
         return self
 
     def encode(self, token_sequence):
-        if self._uses_cpp_backend() and self.codebook.merge_rules:
-            from third_party import graph_bpe_cpp
-
-            return graph_bpe_cpp.encode(token_sequence, self.codebook.merge_rules)
+        bridge = self._native_bridge()
+        if bridge is not None and self.codebook.merge_rules:
+            return bridge.encode(token_sequence, self.codebook.merge_rules)
         encoded = self._as_int_list(token_sequence)
         for merge_rule in self.codebook.merge_rules:
             encoded = self._apply_merge(encoded, merge_rule)
         return encoded
 
     def batch_encode(self, token_sequences):
-        if self._uses_cpp_backend() and self.codebook.merge_rules:
-            from third_party import graph_bpe_cpp
-
-            return graph_bpe_cpp.batch_encode(token_sequences, self.codebook.merge_rules)
+        bridge = self._native_bridge()
+        if bridge is not None and self.codebook.merge_rules:
+            return bridge.batch_encode(token_sequences, self.codebook.merge_rules)
         return [self.encode(sequence) for sequence in token_sequences]
 
-    def _uses_cpp_backend(self) -> bool:
-        return self.backend == "cpp" or (
-            self.backend == "auto"
-            and self.codebook.metadata.get("backend") == "cpp"
-        )
+    def _native_bridge(self):
+        if self.backend != "cpp" and self.codebook.metadata.get("backend") != "cpp":
+            return None
+        from third_party import graph_bpe_cpp
+        if graph_bpe_cpp.is_available():
+            return graph_bpe_cpp
+        if self.backend == "cpp":
+            raise ImportError(
+                "GraphBPE backend='cpp' requires the optional graph_bpe_cpp native extension. "
+                "Use backend='auto' or backend='python' to allow fallback.")
+        return None
 
     def save_codebook(self, path) -> None:
         path = Path(path)

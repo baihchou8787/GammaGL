@@ -339,6 +339,8 @@ def test_graph_gte_manifest_reports_strict_paper_defaults():
 
     assert manifest["encoder_type"] == "gte"
     assert manifest["model_name"] == "gte-base"
+    assert manifest["weight_source"] == "random_initialization"
+    assert manifest["official_checkpoint"] is None
     assert manifest["hidden_size"] == 768
     assert manifest["num_hidden_layers"] == 12
     assert manifest["num_attention_heads"] == 12
@@ -426,24 +428,17 @@ def test_graph_tokenizer_trainer_resolves_paper_dataset_aliases():
 
 def test_graph_tokenizer_trainer_pads_and_masks_token_batches():
     trainer = _load_trainer_module()
+    GraphTokenizer, _ = trainer.load_tokenizer_classes()
+    tokenizer = GraphTokenizer()
 
-    input_ids, attention_mask = trainer.pad_token_sequences(
-        [[3, 6, 4], [3, 7, 8, 4]],
-        max_length=5,
-        pad_token_id=0,
-    )
-    masked_ids, labels = trainer.apply_mlm_mask(
-        input_ids,
-        mask_token_id=2,
-        special_token_ids={0, 3, 4},
-        mask_prob=1.0,
-        seed=7,
-    )
+    batch = tokenizer.build_mlm_batch_from_token_sequences(
+        [[3, 6, 4], [3, 8, 9, 4]], max_length=5, mask_prob=1.0, seed=7)
 
-    assert input_ids == [[3, 6, 4, 0, 0], [3, 7, 8, 4, 0]]
-    assert attention_mask == [[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]]
-    assert masked_ids == [[3, 2, 4, 0, 0], [3, 2, 2, 4, 0]]
-    assert labels == [[-100, 6, -100, -100, -100], [-100, 7, 8, -100, -100]]
+    assert batch.input_ids == [[3, 2, 4, 0, 0], [3, 2, 2, 4, 0]]
+    assert batch.attention_mask == [[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]]
+    assert batch.labels == [[-100, 6, -100, -100, -100], [-100, 8, 9, -100, -100]]
+    assert not hasattr(trainer, "pad_token_sequences")
+    assert not hasattr(trainer, "apply_mlm_mask")
 
 
 def test_graph_tokenizer_trainer_builds_mlm_pretrain_batches():
@@ -454,62 +449,50 @@ def test_graph_tokenizer_trainer_builds_mlm_pretrain_batches():
         "attention_mask": [[1, 1, 1, 0], [1, 1, 1, 1]],
         "labels": [[0.1], [0.2]],
     }
+    GraphTokenizer, _ = trainer.load_tokenizer_classes()
     batch = trainer.build_mlm_pretrain_split(
         encoded_split,
-        mask_token_id=2,
-        special_token_ids={0, 3, 4},
+        tokenizer=GraphTokenizer(),
         mask_prob=1.0,
         seed=9,
     )
 
     assert batch == {
-        "input_ids": [[3, 2, 4, 0], [3, 2, 2, 4]],
+        "input_ids": [[3, 2, 4, 0], [3, 7, 2, 4]],
         "attention_mask": [[1, 1, 1, 0], [1, 1, 1, 1]],
-        "mlm_labels": [[-100, 6, -100, -100], [-100, 7, 8, -100]],
+        "mlm_labels": [[-100, 6, -100, -100], [-100, -100, 8, -100]],
     }
-    assert trainer.count_mlm_labels(batch["mlm_labels"]) == 3
+    assert trainer.count_mlm_labels(batch["mlm_labels"]) == 2
 
 
 def test_graph_tokenizer_trainer_loads_preprocessed_split_files():
     trainer = _load_trainer_module()
     spec = trainer.resolve_dataset_spec("qm9")
 
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        dataset_dir = root / "qm9"
-        dataset_dir.mkdir()
-        samples = [
-            {
-                "edge_index": [[0], [1]],
-                "x": [1, 2],
-                "edge_attr": [1],
-                "properties": _qm9_properties(),
-            },
-            {
-                "edge_index": [[0], [1]],
-                "x": [2, 3],
-                "edge_attr": [2],
-                "properties": _qm9_properties(1.0),
-            },
-            {
-                "edge_index": [[0], [1]],
-                "x": [3, 4],
-                "edge_attr": [3],
-                "properties": _qm9_properties(2.0),
-            },
-        ]
-        with (dataset_dir / "data.pkl").open("wb") as handle:
-            pickle.dump(samples, handle)
-        for split_name, indices in {"train": [0, 2], "val": [1], "test": []}.items():
-            (dataset_dir / f"{split_name}_index.json").write_text(json.dumps(indices), encoding="utf-8")
+    graphs = [
+        types.SimpleNamespace(edge_index=[[0], [1]], x=[index, index + 1], edge_attr=[index], y=[float(index)] * 16)
+        for index in range(3)
+    ]
+    class Dataset:
+        def __len__(self):
+            return len(graphs)
 
-        splits = trainer.load_benchmark_splits(root, spec)
+        def __getitem__(self, index):
+            return graphs[index]
+
+        def get_idx_split(self):
+            return {"train": [0, 2], "val": [1], "test": []}
+
+    dataset = Dataset()
+    trainer.load_gammagl_benchmark_dataset = lambda _root, _spec: dataset
+
+    splits = trainer.load_benchmark_splits("unused", spec)
 
     assert [len(splits[name]) for name in ("train", "val", "test")] == [2, 1, 0]
     assert splits["train"][0].edge_index == [[0], [1]]
-    assert splits["train"][0].x == [3, 5]
-    assert splits["train"][0].edge_attr == [2]
-    assert splits["train"][0].y[:2] == [0.1, 0.2]
+    assert splits["train"][0].x == [0, 1]
+    assert splits["train"][0].edge_attr == [0]
+    assert splits["train"][0].y[:2] == [0.0, 0.0]
 
 
 def test_graph_tokenizer_dataset_loader_bootstraps_repo_import_path(tmp_path, monkeypatch):
@@ -544,48 +527,10 @@ def test_graph_tokenizer_bpe_preflight_bootstraps_repo_import_path(monkeypatch):
     assert calls == [True]
 
 
-def test_graph_tokenizer_trainer_loads_peptides_struct_from_compressed_alias_dir():
+def test_graph_tokenizer_trainer_rejects_benchmarks_without_a_public_dataset():
     trainer = _load_trainer_module()
-    spec = trainer.resolve_dataset_spec("p-struct")
-
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        dataset_dir = root / "p_struct"
-        dataset_dir.mkdir()
-        samples = [
-            (
-                {
-                    "edges": [[0, 1], [1, 0]],
-                    "node_type_ids": [7, 9],
-                    "edge_type_ids": [3, 5],
-                    "node_token_ids": [[15], [19]],
-                    "edge_token_ids": [[6], [10]],
-                },
-                [float(index) / 10.0 for index in range(11)],
-            ),
-            (
-                {
-                    "edges": [[0], [1]],
-                    "node_type_ids": [4, 6],
-                    "edge_type_ids": [2],
-                    "node_token_ids": [[8], [12]],
-                    "edge_token_ids": [[4]],
-                },
-                [1.0 + float(index) / 10.0 for index in range(11)],
-            ),
-        ]
-        with gzip.open(dataset_dir / "data.pkl.gz", "wb") as handle:
-            pickle.dump(samples, handle)
-        for split_name, indices in {"train": [0], "val": [], "test": [1]}.items():
-            (dataset_dir / f"{split_name}_index.json").write_text(json.dumps(indices), encoding="utf-8")
-
-        splits = trainer.load_benchmark_splits(root, spec)
-
-    assert [len(splits[name]) for name in ("train", "val", "test")] == [1, 0, 1]
-    assert splits["train"][0].edge_index == [[0, 1], [1, 0]]
-    assert splits["train"][0].x == [15, 19]
-    assert splits["train"][0].edge_attr == [6, 10]
-    assert splits["train"][0].y == [float(index) / 10.0 for index in range(11)]
+    with pytest.raises(ValueError, match="QM9"):
+        trainer.load_gammagl_benchmark_dataset("unused", trainer.resolve_dataset_spec("p-func"))
 
 
 def test_graph_tokenizer_trainer_computes_primary_metrics():
@@ -606,16 +551,10 @@ def test_graph_tokenizer_trainer_computes_primary_metrics():
     ) == 1.75
 
 
-def test_legacy_mlm_helper_forces_one_mask_when_random_draw_selects_none():
-    trainer = _load_trainer_module()
-
-    masked, labels = trainer.apply_mlm_mask(
-        [[3, 11, 12, 4]],
-        mask_token_id=2,
-        special_token_ids={3, 4},
-        mask_prob=1e-12,
-        seed=0,
-    )
+def test_shared_mlm_helper_forces_one_mask_when_random_draw_selects_none():
+    GraphTokenizer, _ = _load_trainer_module().load_tokenizer_classes()
+    masked, labels = GraphTokenizer().mask_token_sequences(
+        [[3, 11, 12, 4]], mask_prob=1e-12, seed=0)
 
     selected = [
         index for index, label in enumerate(labels[0]) if label != -100
@@ -1072,55 +1011,20 @@ def test_graph_tokenizer_trainer_rejects_unknown_model_name():
         raise AssertionError("unknown model name was accepted")
 
 
-def test_graph_tokenizer_trainer_preflight_rejects_unreadable_dataset(tmp_path):
+def test_graph_tokenizer_trainer_rejects_overlapping_dataset_splits(monkeypatch):
     trainer = _load_trainer_module()
-    dataset_dir = tmp_path / "qm9"
-    dataset_dir.mkdir()
-    (dataset_dir / "data.pkl").write_bytes(b"placeholder")
-    (dataset_dir / "train_index.json").write_text(json.dumps([0, 1]), encoding="utf-8")
-    (dataset_dir / "val_index.json").write_text(json.dumps([2]), encoding="utf-8")
-    (dataset_dir / "test_index.json").write_text(json.dumps([3]), encoding="utf-8")
+    class Dataset(list):
+        def get_idx_split(self):
+            return {"train": [0], "val": [0], "test": [1]}
 
-    class Args:
-        data_root = str(tmp_path)
-        dataset = "qm9"
-        datasets = "qm9"
-        model = "bert"
-        models = "bert,gte"
-        bpe_backend = "python"
-
-    report = trainer.preflight_check(Args())
-
-    assert report["status"] == "failed"
-    assert report["datasets"][0]["status"] == "failed"
-    assert "pickle" in report["datasets"][0]["error"].lower()
-
-
-def test_graph_tokenizer_trainer_rejects_overlapping_flat_split_indices(tmp_path):
-    trainer = _load_trainer_module()
-    dataset_dir = tmp_path / "qm9"
-    dataset_dir.mkdir()
-    samples = [
-        {
-            "edge_index": [[0], [1]],
-            "x": [1, 2],
-            "edge_attr": [1],
-            "properties": _qm9_properties(),
-        },
-        {
-            "edge_index": [[0], [1]],
-            "x": [2, 3],
-            "edge_attr": [1],
-            "properties": _qm9_properties(1.0),
-        },
-    ]
-    with (dataset_dir / "data.pkl").open("wb") as handle:
-        pickle.dump(samples, handle)
-    for split_name, indices in {"train": [0], "val": [0], "test": [1]}.items():
-        (dataset_dir / f"{split_name}_index.json").write_text(json.dumps(indices), encoding="utf-8")
+    dataset = Dataset([
+        types.SimpleNamespace(edge_index=[[], []], x=[], edge_attr=[], y=[0.0] * 16)
+        for _ in range(2)
+    ])
+    monkeypatch.setattr(trainer, "load_gammagl_benchmark_dataset", lambda *_args: dataset)
 
     with pytest.raises(ValueError, match="overlaps"):
-        trainer.load_benchmark_splits(tmp_path, trainer.resolve_dataset_spec("qm9"))
+        trainer.load_benchmark_splits("unused", trainer.resolve_dataset_spec("qm9"))
 
 
 def test_paper_tokenizer_reuses_train_only_local_cache(tmp_path):
@@ -1169,4 +1073,4 @@ def test_graph_tokenizer_trainer_preflight_reports_missing_dataset(tmp_path, mon
     assert report["status"] == "failed"
     assert report["num_errors"] == 1
     assert report["datasets"][0]["status"] == "failed"
-    assert "Dataset directory not found" in report["errors"][0]
+    assert "dataset loader could not materialize" in report["errors"][0]

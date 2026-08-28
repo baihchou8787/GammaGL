@@ -856,7 +856,8 @@ def _evaluate(
         raw_y_pred = _denormalize_labels(torch, y_pred, normalizer)
         raw_details = compute_paper_metric_details(
             spec, raw_y_true.numpy(), raw_y_pred.numpy())
-        metric_details["metric_space"] = "train_standardized"
+        metric_details["metric"] = raw_details["metric"]
+        metric_details["metric_space"] = "raw"
         metric_details["per_target_mae_raw"] = raw_details["per_target_mae"]
     metric = _require_finite_scalar(
         metric_details["metric"],
