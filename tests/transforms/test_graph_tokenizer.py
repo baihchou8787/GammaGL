@@ -343,6 +343,18 @@ def test_graph_tokenizer_fits_serializer_and_bpe_then_encodes_graph():
     assert encoding.metadata["serializer"]["method"] == "feuler"
 
 
+def test_graph_tokenizer_rejects_empty_training_corpus_and_unfitted_encoding():
+    graph_tokenizer = _load_graph_tokenizer_module()
+    graph_bpe = _load_graph_bpe_module()
+    graph = SimpleGraph(edge_index=[[0], [1]], x=[1, 2], edge_attr=[5])
+    tokenizer = graph_tokenizer.GraphTokenizer(bpe=graph_bpe.GraphBPE(num_merges=0))
+
+    with pytest.raises(ValueError, match="empty training corpus"):
+        tokenizer.fit([])
+    with pytest.raises(RuntimeError, match="must be fit"):
+        tokenizer.encode_graph(graph)
+
+
 def test_graph_tokenizer_batch_encodes_serialized_graphs_together(monkeypatch):
     graph_tokenizer = _load_graph_tokenizer_module()
     graph_bpe = _load_graph_bpe_module()
@@ -418,6 +430,22 @@ def test_graph_tokenizer_builds_mlm_batch_from_token_sequences():
     assert batch.labels == [[-100, 6, -100, -100, -100], [-100, 8, 9, -100, -100]]
 
 
+def test_graph_tokenizer_rejects_sequence_overflow_instead_of_truncating():
+    tokenizer = _load_graph_tokenizer_module().GraphTokenizer()
+
+    with pytest.raises(ValueError, match="exceeds max_length"):
+        tokenizer.build_mlm_batch_from_token_sequences(
+            [[3, 6, 7, 4]], max_length=3, mask_prob=0.0)
+
+
+def test_serializer_rejects_multidimensional_features_without_an_adapter():
+    serializer = _load_graph_serializer_module().FrequencyGuidedEulerianSerializer()
+    graph = SimpleGraph(edge_index=[[0], [1]], x=[[1, 2], [1, 9]], edge_attr=[[5, 6]])
+
+    with pytest.raises(ValueError, match="Multi-dimensional"):
+        serializer.fit([graph])
+
+
 def test_graph_tokenizer_mlm_forces_one_mask_when_random_draw_selects_none():
     graph_tokenizer = _load_graph_tokenizer_module()
     tokenizer = graph_tokenizer.GraphTokenizer()
@@ -453,7 +481,7 @@ def test_graph_tokenizer_replaces_component_separator_before_mlm():
     tokenizer = GraphTokenizer(bpe=GraphBPE(num_merges=0, min_frequency=2)).fit([graph])
 
     encoding = tokenizer.encode_graph(graph)
-    batch = tokenizer.build_mlm_batch([graph], max_length=12, mask_prob=1.0, seed=4)
+    batch = tokenizer.build_mlm_batch([graph], max_length=16, mask_prob=1.0, seed=4)
     sep_index = encoding.input_ids.index(tokenizer.special_tokens.component_sep_token_id)
 
     assert -1 not in encoding.input_ids

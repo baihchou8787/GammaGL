@@ -279,10 +279,16 @@ class FrequencyGuidedEulerianSerializer:
 
     def _scalar(self, value: Any) -> int:
         value = self._to_list(value)
-        while self._is_sequence(value):
-            if not value:
-                return 0
+        if self._is_sequence(value):
+            if len(value) != 1:
+                raise ValueError(
+                    "Multi-dimensional node and edge features require explicit "
+                    "dataset-specific token encoding.")
             value = value[0]
+            if self._is_sequence(value):
+                raise ValueError(
+                    "Multi-dimensional node and edge features require explicit "
+                    "dataset-specific token encoding.")
         return int(value)
 
 

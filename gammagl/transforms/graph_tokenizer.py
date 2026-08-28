@@ -53,15 +53,19 @@ class GraphTokenizer(BaseTransform):
         self.bpe = bpe or GraphBPE()
         self.special_tokens = special_tokens or GraphTokenizerSpecialTokens()
         self.add_special_tokens = bool(add_special_tokens)
+        self._fitted = False
 
     def fit(self, graphs):
         graphs = list(graphs)
+        if not graphs:
+            raise ValueError("Cannot fit GraphTokenizer on an empty training corpus.")
         self.serializer.fit(graphs)
         serialized_sequences = [
             self._normalize_serialized_tokens(self.serializer.serialize(graph).token_ids)
             for graph in graphs
         ]
         self.bpe.fit(serialized_sequences)
+        self._fitted = True
         return self
 
     def encode_tokens(self, token_ids: List[int]) -> List[int]:
@@ -92,6 +96,7 @@ class GraphTokenizer(BaseTransform):
                 f"requirement {required_vocab_size}.")
 
     def encode_graph(self, graph: Any) -> GraphTokenizationResult:
+        self._require_fitted()
         serialized = self.serializer.serialize(graph)
         serialized_token_ids = self._normalize_serialized_tokens(serialized.token_ids)
         input_ids = self.encode_tokens(serialized_token_ids)
@@ -111,6 +116,7 @@ class GraphTokenizer(BaseTransform):
         )
 
     def batch_encode_graphs(self, graphs) -> List[GraphTokenizationResult]:
+        self._require_fitted()
         graphs = list(graphs)
         serialized_results = [
             self.serializer.serialize(graph) for graph in graphs
@@ -186,8 +192,13 @@ class GraphTokenizer(BaseTransform):
         )
 
     def pad_token_sequences(self, token_sequences, max_length: int):
+        if max_length <= 0:
+            raise ValueError("max_length must be positive.")
+        if any(len(sequence) > max_length for sequence in token_sequences):
+            raise ValueError(
+                "Token sequence exceeds max_length; truncation would discard graph structure.")
         input_ids = [
-            [int(token) for token in sequence[:max_length]]
+            [int(token) for token in sequence]
             for sequence in token_sequences
         ]
         attention_mask = [
@@ -263,6 +274,10 @@ class GraphTokenizer(BaseTransform):
 
     def _mask_input_ids(self, input_ids: List[List[int]], mask_prob: float, seed: int):
         return self.mask_token_sequences(input_ids, mask_prob=mask_prob, seed=seed)
+
+    def _require_fitted(self) -> None:
+        if not self._fitted:
+            raise RuntimeError("GraphTokenizer must be fit on training graphs before encoding.")
 
     def __call__(self, data: Any):
         encoding = self.encode_graph(data)
