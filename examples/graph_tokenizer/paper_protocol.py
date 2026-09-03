@@ -21,6 +21,8 @@ PAPER_RUNTIME_REQUIREMENTS = {
     "torch_geometric": "2.4.0",
 }
 
+PAPER_SOURCE_REVISION = "98343a6b025a48fbb6859cd812a12b81ec3ac3cc"
+
 PAPER_ARCHITECTURES = {
     "bert": {
         "hidden_size": 512,
@@ -35,6 +37,7 @@ PAPER_ARCHITECTURES = {
         "intermediate_size": 3072,
         "num_hidden_layers": 12,
         "num_attention_heads": 12,
+        "max_position_embeddings": 8192,
         "parameter_estimate": 115_000_000,
     },
 }
@@ -266,10 +269,10 @@ def validate_paper_args(args, spec) -> None:
             "Paper protocol supports only QM9, OGBG-molhiv and Peptides-struct.")
     if spec.canonical_name == "qm9":
         target_property = getattr(args, "target_property", None)
-        if target_property is not None:
+        if target_property not in {None, "homo"}:
             raise ValueError(
-                "QM9 strict paper protocol is a joint 16-target regression; "
-                "do not pass --target-property.")
+                "QM9 strict paper protocol evaluates the single HOMO target; "
+                "use --target-property=homo or omit the option.")
     requested_model = getattr(args, "model", None)
     if requested_model and requested_model not in {"bert", "gte"}:
         raise ValueError("Paper protocol model must be 'bert' or 'gte'.")
@@ -282,6 +285,10 @@ def validate_paper_args(args, spec) -> None:
                 "Paper protocol requires "
                 f"--max-position-embeddings={expected_position_limit} for "
                 f"{requested_model}.")
+    if requested_model == "gte" and bool(getattr(
+            args, "allow_random_gte_init", False)):
+        raise ValueError(
+            "Strict paper protocol requires the pinned pretrained GTE weights.")
 
 
 def paper_run_seeds(args) -> List[int]:
@@ -308,9 +315,77 @@ def _should_skip_finetuning(
     )
 
 
-def paper_training_options(args) -> Dict[str, Any]:
+def _paper_token_augmentation() -> Dict[str, Any]:
+    return {
+        "pretrain": {
+            "random_swap": {
+                "probability": 0.5, "ratio": 0.1, "window_size": 3}},
+        "finetune": {
+            "random_swap": {
+                "probability": 0.4, "ratio": 0.05, "window_size": 3},
+            "sequence_masking": {"probability": 0.3, "ratio": 0.05},
+        },
+        "evaluation": "none",
+    }
+
+
+def paper_reference_options(spec, encoder: str) -> Dict[str, Any]:
+    """Return the pinned official settings used for strict comparison."""
+    encoder = str(encoder).lower()
+    if encoder not in PAPER_ARCHITECTURES:
+        raise ValueError("Paper protocol encoder must be 'bert' or 'gte'.")
+    dataset = spec.canonical_name
+    pretrain_lr = (
+        1e-4 if encoder == "bert" or dataset == "peptides-struct" else 5e-5)
+    return {
+        "source_revision": PAPER_SOURCE_REVISION,
+        "encoder": encoder,
+        "serialization": "feuler",
+        "pretrain_epochs": 200,
+        "finetune_epochs": 200,
+        "pretrain_lr": pretrain_lr,
+        "finetune_lr": 5e-5 if dataset == "molhiv" else 1e-5,
+        "batch_size": 16 if dataset == "peptides-struct" else 32,
+        "weight_decay": 0.1,
+        "pretrain_warmup_ratio": 0.12,
+        "finetune_warmup_ratio": 0.025,
+        "pretrain_max_grad_norm": 2.0,
+        "finetune_max_grad_norm": 0.5,
+        "mask_prob": 0.09,
+        "patience": 20,
+        "max_position_embeddings": int(
+            PAPER_ARCHITECTURES[encoder]["max_position_embeddings"]),
+        "max_sequence_length": 768 if encoder == "bert" else 8096,
+        "num_merges": 2000,
+        "min_frequency": 2,
+        "num_realizations": 100,
+        "aggregation_mode": "avg",
+        "pooling": "mean",
+        "amp_dtype": "off",
+        "allow_tf32": False,
+        "training_loss": "default",
+        "molhiv_pos_weight": False,
+        "token_augmentation": _paper_token_augmentation(),
+        "gaussian_noise": {"probability": 0.3, "std": 0.01},
+        "pretraining_graph_corpus": (
+            "peptides-func" if dataset == "peptides-struct" else dataset),
+    }
+
+
+def validate_paper_training_options(options, spec) -> None:
+    expected = paper_reference_options(spec, options["encoder"])
+    for name, expected_value in expected.items():
+        actual = options.get(name)
+        if actual != expected_value:
+            raise ValueError(
+                f"Strict paper protocol requires {name}={expected_value!r}; "
+                f"received {actual!r}.")
+
+
+def paper_training_options(args, spec=None) -> Dict[str, Any]:
+    encoder = str(args.model).lower()
     options = {
-        "encoder": args.model,
+        "encoder": encoder,
         "serialization": args.serialization,
         "pretrain_epochs": args.pretrain_epoch,
         "finetune_epochs": args.n_epoch,
@@ -325,6 +400,16 @@ def paper_training_options(args) -> Dict[str, Any]:
         "mask_prob": args.mask_prob,
         "patience": args.patience,
         "max_position_embeddings": args.max_position_embeddings,
+        "max_sequence_length": 768 if encoder == "bert" else 8096,
+        "num_merges": int(getattr(args, "num_merges", 2000)),
+        "min_frequency": int(getattr(args, "min_frequency", 2)),
+        "num_realizations": int(getattr(args, "num_realizations", 100)),
+        "aggregation_mode": str(getattr(args, "aggregation_mode", "avg")),
+        "pooling": str(getattr(args, "pooling", "mean")),
+        "amp_dtype": "off",
+        "allow_tf32": False,
+        "training_loss": "default",
+        "molhiv_pos_weight": False,
     }
     cli_overrides = {
         "amp_dtype": getattr(args, "paper_amp", None),
@@ -336,6 +421,15 @@ def paper_training_options(args) -> Dict[str, Any]:
         key: value for key, value in cli_overrides.items()
         if value is not None
     })
+    if spec is not None:
+        options.update({
+            "source_revision": PAPER_SOURCE_REVISION,
+            "token_augmentation": _paper_token_augmentation(),
+            "gaussian_noise": {"probability": 0.3, "std": 0.01},
+            "pretraining_graph_corpus": (
+                "peptides-func" if spec.canonical_name == "peptides-struct"
+                else spec.canonical_name),
+        })
     return options
 
 
@@ -368,66 +462,123 @@ def _pad_sequences(sequences: Sequence[Sequence[int]], max_length: int, pad_toke
 
 def _encode_splits(
         tokenizer, splits, max_position_embeddings: int,
-        encoding_batch_size: int = 2048):
+        encoding_batch_size: int = 2048,
+        max_sequence_length: int | None = None,
+        num_realizations: int = 1):
+    max_sequence_length = int(
+        max_position_embeddings if max_sequence_length is None
+        else max_sequence_length)
+    if max_sequence_length <= 0 or max_sequence_length > max_position_embeddings:
+        raise ValueError(
+            "max_sequence_length must be positive and no greater than "
+            "max_position_embeddings.")
+    num_realizations = int(num_realizations)
+    if num_realizations <= 0:
+        raise ValueError("num_realizations must be positive.")
+
+    def truncate(sequence):
+        sequence = list(map(int, sequence))
+        if len(sequence) <= max_sequence_length:
+            return sequence
+        return [
+            *sequence[:max_sequence_length - 1],
+            int(tokenizer.special_tokens.sep_token_id),
+        ]
+
+    def start_nodes(graph):
+        method = getattr(tokenizer, "realization_start_nodes", None)
+        if callable(method):
+            return method(graph, num_realizations)
+        if num_realizations == 1:
+            return [None]
+        value = getattr(graph, "num_nodes", None)
+        if callable(value):
+            value = value()
+        total_nodes = int(value)
+        actual_samples = min(num_realizations, total_nodes)
+        step = max(1, total_nodes // actual_samples)
+        return [(index * step) % total_nodes for index in range(actual_samples)]
+
     encoded = {}
     global_max_length = 1
     for split_name, graphs in splits.items():
         if not graphs:
             raise ValueError(
                 f"Paper protocol requires a non-empty {split_name} split.")
-        if hasattr(tokenizer, "batch_encode_graphs"):
-            sequences = []
+        results = []
+        graph_ids = []
+        if num_realizations == 1 and hasattr(tokenizer, "batch_encode_graphs"):
             encoding_batch_size = max(1, int(encoding_batch_size))
             for start in range(0, len(graphs), encoding_batch_size):
                 graph_batch = graphs[start:start + encoding_batch_size]
-                results = tokenizer.batch_encode_graphs(graph_batch)
-                if len(results) != len(graph_batch):
+                batch_results = tokenizer.batch_encode_graphs(graph_batch)
+                if len(batch_results) != len(graph_batch):
                     raise RuntimeError(
                         "Tokenizer batch encoding returned the wrong count.")
-                sequences.extend(result.input_ids for result in results)
+                results.extend(batch_results)
+                graph_ids.extend(range(start, start + len(graph_batch)))
         else:
-            sequences = [
-                tokenizer.encode_graph(graph).input_ids for graph in graphs
-            ]
+            for graph_id, graph in enumerate(graphs):
+                for start_node in start_nodes(graph):
+                    result = (
+                        tokenizer.encode_graph(graph)
+                        if start_node is None
+                        else tokenizer.encode_graph(graph, start_node=start_node))
+                    results.append(result)
+                    graph_ids.append(graph_id)
+        sequences = [truncate(result.input_ids) for result in results]
         maximum = max((len(sequence) for sequence in sequences), default=1)
-        if maximum > max_position_embeddings:
-            raise ValueError(
-                f"{split_name} sequence length {maximum} exceeds "
-                f"max_position_embeddings={max_position_embeddings}.")
         global_max_length = max(global_max_length, maximum)
         encoded[split_name] = {
-            "input_ids": [list(map(int, sequence)) for sequence in sequences],
-            "labels": [list(graph.y) for graph in graphs],
+            "input_ids": sequences,
+            "serialized_token_ids": [
+                list(map(int, getattr(result, "serialized_token_ids", [])))
+                for result in results
+            ],
+            "labels": [list(graphs[graph_id].y) for graph_id in graph_ids],
+            "graph_ids": graph_ids,
         }
     return encoded, global_max_length
 
 
 def _load_or_encode_splits(
         tokenizer, splits, max_position_embeddings: int,
-        cache_path, cache_key: str):
+        cache_path, cache_key: str, max_sequence_length: int | None = None,
+        num_realizations: int = 1):
+    max_sequence_length = int(
+        max_position_embeddings if max_sequence_length is None
+        else max_sequence_length)
     cache_path = Path(cache_path)
     if cache_path.is_file():
         try:
             with cache_path.open("rb") as handle:
                 cached = pickle.load(handle)
             if (
-                    cached.get("cache_version") == 1
+                    cached.get("cache_version") == 2
                     and cached.get("cache_key") == str(cache_key)
                     and cached.get("max_position_embeddings")
-                    == int(max_position_embeddings)):
+                    == int(max_position_embeddings)
+                    and cached.get("max_sequence_length")
+                    == max_sequence_length
+                    and cached.get("num_realizations")
+                    == int(num_realizations)):
                 return cached["encoded"], int(cached["global_max_length"])
         except (OSError, EOFError, AttributeError, KeyError, pickle.UnpicklingError):
             pass
     encoded, global_max_length = _encode_splits(
-        tokenizer, splits, int(max_position_embeddings))
+        tokenizer, splits, int(max_position_embeddings),
+        max_sequence_length=max_sequence_length,
+        num_realizations=num_realizations)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = cache_path.with_name(
         f".{cache_path.name}.tmp-{os.getpid()}")
     with temporary.open("wb") as handle:
         pickle.dump({
-            "cache_version": 1,
+            "cache_version": 2,
             "cache_key": str(cache_key),
             "max_position_embeddings": int(max_position_embeddings),
+            "max_sequence_length": max_sequence_length,
+            "num_realizations": int(num_realizations),
             "global_max_length": int(global_max_length),
             "encoded": encoded,
         }, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -435,7 +586,10 @@ def _load_or_encode_splits(
     return encoded, global_max_length
 
 
-def _encoded_splits_cache_key(tokenizer, splits, max_position_embeddings: int) -> str:
+def _encoded_splits_cache_key(
+        tokenizer, splits, max_position_embeddings: int,
+        max_sequence_length: int | None = None,
+        num_realizations: int = 1) -> str:
     split_digests = {}
     for split_name, graphs in splits.items():
         digest = hashlib.sha256()
@@ -455,7 +609,7 @@ def _encoded_splits_cache_key(tokenizer, splits, max_position_embeddings: int) -
             digest.update(pickle.dumps(fields, protocol=4))
         split_digests[split_name] = digest.hexdigest()
     state = {
-        "cache_version": 1,
+        "cache_version": 2,
         "tokenizer_cache_key": getattr(tokenizer, "_cache_key", None),
         "serializer": getattr(tokenizer.serializer, "name", None),
         "frequency_map": sorted(tokenizer.serializer.frequency_map.items()),
@@ -466,46 +620,85 @@ def _encoded_splits_cache_key(tokenizer, splits, max_position_embeddings: int) -
         },
         "split_digests": split_digests,
         "max_position_embeddings": int(max_position_embeddings),
+        "max_sequence_length": int(
+            max_position_embeddings if max_sequence_length is None
+            else max_sequence_length),
+        "num_realizations": int(num_realizations),
     }
     return hashlib.sha256(pickle.dumps(state, protocol=4)).hexdigest()
 
 
 def _prepare_labels(encoded, spec, target_property):
     if spec.canonical_name == "qm9":
-        output_dim = int(spec.output_dim)
-        target_properties = list(spec.label_keys)
-        if len(target_properties) != output_dim:
+        source_width = int(spec.output_dim)
+        source_properties = list(spec.label_keys)
+        if len(source_properties) != source_width:
             raise ValueError(
-                f"QM9 requires exactly {output_dim} target property names; "
-                f"received {len(target_properties)}.")
+                f"QM9 requires exactly {source_width} target property names; "
+                f"received {len(source_properties)}.")
+        selected_target = "homo" if target_property is None else str(target_property)
+        if selected_target != "homo" or selected_target not in source_properties:
+            raise ValueError("QM9 paper evaluation requires the HOMO target.")
+        target_index = source_properties.index(selected_target)
         if not encoded["train"]["labels"]:
             raise ValueError("QM9 training split cannot be empty.")
         for split_name, split in encoded.items():
             for row_index, row in enumerate(split["labels"]):
-                if len(row) != output_dim:
+                if len(row) != source_width:
                     raise ValueError(
                         f"QM9 {split_name} label row {row_index} must contain "
-                        f"exactly {output_dim} targets; received {len(row)}.")
-                if not all(math.isfinite(float(value)) for value in row):
+                        f"exactly {source_width} targets; received {len(row)}.")
+                if not math.isfinite(float(row[target_index])):
                     raise ValueError(
                         f"QM9 {split_name} label row {row_index} contains a "
                         "non-finite target.")
+        train_values = [
+            float(row[target_index]) for row in encoded["train"]["labels"]]
+        means = [sum(train_values) / len(train_values)]
+        variance = sum(
+            (value - means[0]) ** 2 for value in train_values
+        ) / len(train_values)
+        stds = [max(math.sqrt(variance), 1e-12)]
+        for split in encoded.values():
+            split["labels"] = [
+                [(float(row[target_index]) - means[0]) / stds[0]]
+                for row in split["labels"]
+            ]
+        return {
+            "mean": means,
+            "std": stds,
+            "target_properties": [selected_target],
+        }, 1
+    if spec.canonical_name == "peptides-struct":
+        output_dim = int(spec.output_dim)
+        target_properties = list(getattr(spec, "label_keys", ()))
+        if len(target_properties) != output_dim:
+            target_properties = [f"target_{index}" for index in range(output_dim)]
+        for split_name, split in encoded.items():
+            for row_index, row in enumerate(split["labels"]):
+                if len(row) != output_dim:
+                    raise ValueError(
+                        f"Peptides-struct {split_name} label row {row_index} "
+                        f"must contain exactly {output_dim} targets; received "
+                        f"{len(row)}.")
         train_rows = [list(map(float, row)) for row in encoded["train"]["labels"]]
-        means = [
-            sum(row[index] for row in train_rows) / len(train_rows)
-            for index in range(output_dim)
-        ]
-        variances = [
-            sum((row[index] - means[index]) ** 2 for row in train_rows)
-            / len(train_rows)
-            for index in range(output_dim)
-        ]
-        stds = [max(math.sqrt(variance), 1e-12) for variance in variances]
+        means, stds = [], []
+        for index in range(output_dim):
+            values = [row[index] for row in train_rows if math.isfinite(row[index])]
+            if not values:
+                raise ValueError(
+                    f"Peptides-struct training target {index} has no finite labels.")
+            target_mean = sum(values) / len(values)
+            variance = sum(
+                (value - target_mean) ** 2 for value in values) / len(values)
+            means.append(target_mean)
+            stds.append(max(math.sqrt(variance), 1e-12))
         for split in encoded.values():
             split["labels"] = [
                 [
-                    (float(row[index]) - means[index]) / stds[index]
-                    for index in range(output_dim)
+                    ((float(value) - means[index]) / stds[index]
+                     if math.isfinite(float(value)) else float("nan"))
+                    for index, value in enumerate(row)
                 ]
                 for row in split["labels"]
             ]
@@ -514,6 +707,8 @@ def _prepare_labels(encoded, spec, target_property):
             "std": stds,
             "target_properties": target_properties,
         }, output_dim
+    if spec.canonical_name == "molhiv":
+        return None, 2
     return None, spec.output_dim
 
 
@@ -524,13 +719,13 @@ def _denormalize_labels(torch, values, normalizer):
         normalizer["std"], dtype=values.dtype, device=values.device)
     if values.ndim < 1 or values.shape[-1] != len(means):
         raise ValueError(
-            "Normalized label width does not match the QM9 normalizer.")
+            "Normalized label width does not match the target normalizer.")
     return values * stds + means
 
 
 def _metric_semantics(spec, normalizer):
     """Describe the training-loss and reported-metric spaces explicitly."""
-    if spec.canonical_name == "qm9":
+    if spec.canonical_name in {"qm9", "peptides-struct"}:
         normalization = {"type": "train_split_zscore"}
         if normalizer is not None:
             normalization.update({
@@ -546,12 +741,6 @@ def _metric_semantics(spec, normalizer):
         return {
             "loss_space": "logits",
             "metric_space": "probability",
-            "target_normalization": {"type": "none"},
-        }
-    if spec.canonical_name == "peptides-struct":
-        return {
-            "loss_space": "raw",
-            "metric_space": "raw",
             "target_normalization": {"type": "none"},
         }
     return {
@@ -595,6 +784,53 @@ class _LengthBucketBatchSampler:
         yield from batches
 
 
+def _random_swap(tokens, probability: float, ratio: float, window_size: int):
+    if random.random() > float(probability) or len(tokens) <= 1:
+        return tokens
+    num_swaps = max(0, int(len(tokens) * float(ratio)))
+    if num_swaps == 0:
+        return tokens
+    augmented = list(tokens)
+    for _ in range(num_swaps):
+        center = random.randint(0, len(augmented) - 1)
+        window_start = max(0, center - int(window_size) // 2)
+        window_end = min(
+            len(augmented), center + int(window_size) // 2 + 1)
+        if window_end - window_start >= 2:
+            first, second = random.sample(range(window_start, window_end), 2)
+            augmented[first], augmented[second] = (
+                augmented[second], augmented[first])
+    return augmented
+
+
+def _sequence_mask(tokens, mask_token_id: int, probability: float, ratio: float):
+    if random.random() > float(probability) or len(tokens) <= 1:
+        return tokens
+    count = max(1, min(int(len(tokens) * float(ratio)), len(tokens) - 1))
+    positions = random.sample(range(len(tokens)), count)
+    augmented = list(tokens)
+    for position in positions:
+        augmented[position] = int(mask_token_id)
+    return augmented
+
+
+def _augment_serialized_tokens(tokens, stage: str, mask_token_id: int):
+    """Apply the pinned official pre-BPE token transforms."""
+    tokens = list(tokens)
+    if stage == "pretrain":
+        return _random_swap(
+            tokens, probability=0.5, ratio=0.1, window_size=3)
+    if stage == "finetune":
+        tokens = _random_swap(
+            tokens, probability=0.4, ratio=0.05, window_size=3)
+        return _sequence_mask(
+            tokens, mask_token_id=mask_token_id,
+            probability=0.3, ratio=0.05)
+    if stage in {None, "evaluation"}:
+        return tokens
+    raise ValueError("augmentation stage must be pretrain, finetune or evaluation.")
+
+
 def _make_loader(
         torch,
         encoded_split,
@@ -603,28 +839,77 @@ def _make_loader(
         pad_token_id: int = 0,
         num_workers: int = 0,
         pin_memory: bool = False,
-        bucket_by_length: bool = True):
+        bucket_by_length: bool = True,
+        group_by_graph: bool = False,
+        return_graph_ids: bool = False,
+        tokenizer=None,
+        augmentation_stage: str | None = None,
+        max_sequence_length: int | None = None):
     input_ids = encoded_split["input_ids"]
     labels = encoded_split["labels"]
     if len(input_ids) != len(labels):
         raise ValueError("Encoded input and label counts must match.")
     if not input_ids:
         raise ValueError("Cannot create a paper DataLoader from an empty split.")
-    dataset = list(zip(input_ids, labels))
+    graph_ids = list(encoded_split.get("graph_ids", range(len(input_ids))))
+    if len(graph_ids) != len(input_ids):
+        raise ValueError("Encoded graph ID and input counts must match.")
+    serialized = list(encoded_split.get(
+        "serialized_token_ids", [None] * len(input_ids)))
+    if len(serialized) != len(input_ids):
+        raise ValueError("Serialized token and input counts must match.")
+    records = list(zip(input_ids, labels, graph_ids, serialized))
+    if group_by_graph:
+        grouped = {}
+        for record in records:
+            grouped.setdefault(int(record[2]), []).append(record)
+        dataset = list(grouped.values())
+        dataset_lengths = [
+            max(len(record[0]) for record in group) for group in dataset]
+    else:
+        dataset = records
+        dataset_lengths = [len(sequence) for sequence in input_ids]
 
     def collate_batch(batch):
-        maximum = max(len(sequence) for sequence, _ in batch)
+        if group_by_graph:
+            batch = [random.choice(group) for group in batch]
+        prepared = []
+        for sequence, label, graph_id, raw_tokens in batch:
+            if augmentation_stage is not None:
+                if tokenizer is None or raw_tokens is None:
+                    raise ValueError(
+                        "Token augmentation requires tokenizer and serialized tokens.")
+                raw_tokens = _augment_serialized_tokens(
+                    raw_tokens, augmentation_stage,
+                    tokenizer.special_tokens.mask_token_id)
+                sequence = tokenizer.encode_tokens(raw_tokens)
+                if (
+                        max_sequence_length is not None
+                        and len(sequence) > int(max_sequence_length)):
+                    sequence = [
+                        *sequence[:int(max_sequence_length) - 1],
+                        int(tokenizer.special_tokens.sep_token_id),
+                    ]
+            prepared.append((sequence, label, graph_id))
+        batch = prepared
+        maximum = max(len(sequence) for sequence, _, _ in batch)
         padded = torch.full(
             (len(batch), maximum), int(pad_token_id), dtype=torch.long)
         attention_mask = torch.zeros_like(padded)
-        for row, (sequence, _) in enumerate(batch):
+        for row, (sequence, _, _) in enumerate(batch):
             length = len(sequence)
             if length:
                 padded[row, :length] = torch.as_tensor(
                     sequence, dtype=torch.long)
                 attention_mask[row, :length] = 1
         batch_labels = torch.as_tensor(
-            [label for _, label in batch], dtype=torch.float32)
+            [label for _, label, _ in batch], dtype=torch.float32)
+        if return_graph_ids:
+            return (
+                padded, attention_mask, batch_labels,
+                torch.as_tensor(
+                    [graph_id for _, _, graph_id in batch], dtype=torch.long),
+            )
         return padded, attention_mask, batch_labels
 
     workers = max(0, int(num_workers))
@@ -644,7 +929,7 @@ def _make_loader(
     if bucket_by_length:
         loader_kwargs["batch_sampler"] = _LengthBucketBatchSampler(
             torch,
-            [len(sequence) for sequence in input_ids],
+            dataset_lengths,
             batch_size=int(batch_size),
             shuffle=shuffle,
         )
@@ -655,39 +940,56 @@ def _make_loader(
         })
     loader = torch.utils.data.DataLoader(dataset, **loader_kwargs)
     loader.dynamic_padding = True
+    loader.group_by_graph = bool(group_by_graph)
+    loader.returns_graph_ids = bool(return_graph_ids)
     loader.worker_seed_generator = worker_seed_generator
     return loader
 
 
-def _linear_warmup_scheduler(torch, optimizer, total_steps: int, warmup_ratio: float):
-    warmup_steps = max(1, int(total_steps * float(warmup_ratio)))
+def _warmup_cosine_scheduler(torch, optimizer, total_steps: int, warmup_ratio: float):
+    warmup_steps = int(total_steps * float(warmup_ratio))
+    if warmup_steps >= total_steps:
+        warmup_steps = max(0, total_steps - 1)
 
     def multiplier(step):
-        if step < warmup_steps:
+        if warmup_steps > 0 and step < warmup_steps:
             return float(step + 1) / warmup_steps
-        return max(0.0, float(total_steps - step) / max(1, total_steps - warmup_steps))
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(step - warmup_steps) / decay_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.01 + 0.99 * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
 def _mask_for_mlm(torch, input_ids, attention_mask, tokenizer, mask_prob: float):
+    masked = input_ids.clone()
     labels = input_ids.clone()
-    maskable = attention_mask.bool()
+    special = torch.zeros_like(labels, dtype=torch.bool)
     for token_id in (
         tokenizer.special_tokens.pad_token_id,
         tokenizer.special_tokens.cls_token_id,
         tokenizer.special_tokens.sep_token_id,
-        tokenizer.special_tokens.component_sep_token_id,
     ):
-        maskable &= input_ids.ne(int(token_id))
-    selected = torch.rand_like(input_ids, dtype=torch.float32).lt(float(mask_prob)) & maskable
-    if float(mask_prob) > 0:
-        flat_maskable = maskable.reshape(-1)
-        first_maskable = flat_maskable & flat_maskable.cumsum(dim=0).eq(1)
-        selected |= first_maskable.reshape_as(selected) & ~selected.any()
+        special |= input_ids.eq(int(token_id))
+    special |= ~attention_mask.bool()
+    probabilities = torch.full(
+        labels.shape, float(mask_prob), dtype=torch.float32,
+        device=labels.device)
+    probabilities.masked_fill_(special, 0.0)
+    selected = torch.bernoulli(probabilities).bool()
     labels[~selected] = -100
-    masked = input_ids.clone()
-    masked[selected] = int(tokenizer.special_tokens.mask_token_id)
+    replaced = torch.bernoulli(torch.full(
+        labels.shape, 0.8, device=labels.device)).bool() & selected
+    masked[replaced] = int(tokenizer.special_tokens.mask_token_id)
+    random_replaced = (
+        torch.bernoulli(torch.full(
+            labels.shape, 0.5, device=labels.device)).bool()
+        & selected & ~replaced)
+    random_words = torch.randint(
+        int(tokenizer.max_token_id) + 1, labels.shape,
+        dtype=torch.long, device=labels.device)
+    masked[random_replaced] = random_words[random_replaced]
     return masked, labels
 
 
@@ -698,18 +1000,17 @@ def _loss(
     labels = labels.float()
     loss_name = str(loss_name).lower()
     if spec.canonical_name == "molhiv":
-        if loss_name not in {"default", "focal"}:
-            raise ValueError("OGBG-molhiv loss must be 'default' or 'focal'.")
-        logits = logits.view(-1)
-        labels = labels.view(-1)
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, labels, pos_weight=pos_weight, reduction="none")
-        if loss_name == "focal":
-            probabilities = torch.sigmoid(logits)
-            probability_of_target = (
-                probabilities * labels + (1 - probabilities) * (1 - labels))
-            bce = (1 - probability_of_target).pow(float(focal_gamma)) * bce
-        return bce.mean()
+        if loss_name != "default" or pos_weight is not None:
+            raise ValueError(
+                "Strict OGBG-molhiv paper loss is unweighted cross entropy.")
+        if logits.ndim != 2 or logits.shape[-1] != 2:
+            raise ValueError("OGBG-molhiv paper model must output two logits.")
+        labels = labels.reshape(-1)
+        valid = torch.isfinite(labels)
+        if not torch.any(valid):
+            raise ValueError("OGBG-molhiv batch contains no valid labels.")
+        return torch.nn.functional.cross_entropy(
+            logits[valid], labels[valid].long())
     valid = None
     if spec.canonical_name == "peptides-struct":
         valid = ~torch.isnan(labels)
@@ -717,6 +1018,8 @@ def _loss(
             raise ValueError("Peptides-struct batch contains no valid labels.")
         logits = logits[valid]
         labels = labels[valid]
+    if loss_name == "default" and spec.canonical_name == "peptides-struct":
+        return torch.nn.functional.l1_loss(logits, labels)
     if loss_name == "default":
         return torch.nn.functional.mse_loss(logits, labels)
     if loss_name == "l1":
@@ -836,7 +1139,8 @@ def compute_paper_metric(spec, y_true, y_pred) -> float:
     return float(np.abs(y_true - y_pred).mean())
 
 
-def compute_paper_metric_details(spec, y_true, y_pred) -> Dict[str, Any]:
+def compute_paper_metric_details(
+        spec, y_true, y_pred, target_names=None) -> Dict[str, Any]:
     import numpy as np
 
     y_true = np.asarray(y_true, dtype=float)
@@ -847,7 +1151,8 @@ def compute_paper_metric_details(spec, y_true, y_pred) -> Dict[str, Any]:
     if y_true.ndim == 1:
         y_true = y_true.reshape(-1, 1)
         y_pred = y_pred.reshape(-1, 1)
-    configured_names = list(getattr(spec, "label_keys", ()))
+    configured_names = list(
+        target_names if target_names is not None else getattr(spec, "label_keys", ()))
     if len(configured_names) == y_true.shape[1]:
         target_names = configured_names
     else:
@@ -868,10 +1173,11 @@ def _evaluate(
     _set_paper_model_mode(model, training=False)
     total_loss = 0.0
     total_examples = 0
-    targets, predictions = [], []
+    targets, predictions, graph_ids = [], [], []
     non_blocking = bool(getattr(loader, "pin_memory", False))
     with torch.no_grad():
-        for input_ids, attention_mask, labels in loader:
+        for batch in loader:
+            input_ids, attention_mask, labels = batch[:3]
             input_ids = input_ids.to(device, non_blocking=non_blocking)
             attention_mask = attention_mask.to(
                 device, non_blocking=non_blocking)
@@ -885,25 +1191,50 @@ def _evaluate(
             total_examples += len(input_ids)
             metric_logits = logits.float()
             if spec.canonical_name == "molhiv":
-                predictions.append(torch.sigmoid(metric_logits).cpu())
+                predictions.append(
+                    torch.softmax(metric_logits, dim=-1)[:, 1:2].cpu())
             else:
                 predictions.append(metric_logits.cpu())
             targets.append(labels.cpu())
+            if len(batch) > 3:
+                graph_ids.append(batch[3].cpu())
     y_true = torch.cat(targets, dim=0)
     y_pred = torch.cat(predictions, dim=0)
+    num_sequences = int(len(y_true))
+    if graph_ids:
+        all_graph_ids = torch.cat(graph_ids, dim=0)
+        unique_ids = []
+        seen = set()
+        for graph_id in all_graph_ids.tolist():
+            if graph_id not in seen:
+                seen.add(graph_id)
+                unique_ids.append(graph_id)
+        grouped_targets, grouped_predictions = [], []
+        for graph_id in unique_ids:
+            selected = all_graph_ids.eq(int(graph_id))
+            grouped_targets.append(y_true[selected][0])
+            grouped_predictions.append(y_pred[selected].mean(dim=0))
+        y_true = torch.stack(grouped_targets)
+        y_pred = torch.stack(grouped_predictions)
     average_loss = _require_finite_scalar(
         total_loss / max(1, total_examples), "evaluation loss")
+    target_names = (
+        normalizer.get("target_properties") if normalizer is not None else None)
     metric_details = compute_paper_metric_details(
-        spec, y_true.numpy(), y_pred.numpy())
+        spec, y_true.numpy(), y_pred.numpy(), target_names=target_names)
     metric_details["metric_space"] = _metric_semantics(
         spec, normalizer)["metric_space"]
-    if normalizer is not None and spec.canonical_name == "qm9":
+    if normalizer is not None and spec.canonical_name in {
+            "qm9", "peptides-struct"}:
         raw_y_true = _denormalize_labels(torch, y_true, normalizer)
         raw_y_pred = _denormalize_labels(torch, y_pred, normalizer)
         raw_details = compute_paper_metric_details(
-            spec, raw_y_true.numpy(), raw_y_pred.numpy())
-        metric_details["metric"] = raw_details["metric"]
-        metric_details["per_target_mae_raw"] = raw_details["per_target_mae"]
+            spec, raw_y_true.numpy(), raw_y_pred.numpy(),
+            target_names=target_names)
+        metric_details = {
+            **raw_details,
+            "metric_space": _metric_semantics(spec, normalizer)["metric_space"],
+        }
     metric = _require_finite_scalar(
         metric_details["metric"],
         f"{spec.canonical_name} validation metric",
@@ -911,6 +1242,8 @@ def _evaluate(
     return {
         "loss": average_loss,
         "metric": metric,
+        "num_graphs": int(len(y_true)),
+        "num_sequences": num_sequences,
         **{
             key: value for key, value in metric_details.items()
             if key != "metric"
@@ -1047,7 +1380,7 @@ def _experiment_fingerprint(
         preset, spec, encoded_cache_key: str, model_vocab_size: int,
         pooling: str, seed: int, run_index: int) -> str:
     payload = {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "preset": preset,
         "dataset": spec.canonical_name,
         "task_type": spec.task_type,
@@ -1092,11 +1425,21 @@ def _normalize_accumulated_gradients(model, denominator: int) -> None:
             parameter.grad.div_(denominator)
 
 
+def _forward_supervised(
+        torch, model, input_ids, attention_mask, gaussian_noise=None):
+    if gaussian_noise is None or not callable(getattr(model, "_task_logits", None)):
+        return model(input_ids, attention_mask, task="supervised")
+    pooled = model(input_ids, attention_mask, task="pooled")
+    if random.random() <= float(gaussian_noise["probability"]):
+        pooled = pooled + torch.randn_like(pooled) * float(gaussian_noise["std"])
+    return model._task_logits(pooled)
+
+
 def _train_supervised(
         torch, model, loader, optimizer, scheduler, spec, device,
         max_grad_norm, gradient_accumulation_steps: int = 1,
         loss_name: str = "default", pos_weight=None,
-        torch_dtype=None, grad_scaler=None):
+        torch_dtype=None, grad_scaler=None, gaussian_noise=None):
     _set_paper_model_mode(model, training=True)
     non_blocking = bool(getattr(loader, "pin_memory", False))
     accumulation = max(1, int(gradient_accumulation_steps))
@@ -1108,10 +1451,12 @@ def _train_supervised(
     for step, (input_ids, attention_mask, labels) in enumerate(loader):
         labels = labels.to(device, non_blocking=non_blocking)
         with _autocast_context(torch, device, torch_dtype):
-            logits = model(
+            logits = _forward_supervised(
+                torch,
+                model,
                 input_ids.to(device, non_blocking=non_blocking),
                 attention_mask.to(device, non_blocking=non_blocking),
-                task="supervised",
+                gaussian_noise=gaussian_noise,
             )
             _require_finite_tensor(torch, logits, "supervised logits")
             loss = _loss(
@@ -1167,10 +1512,12 @@ def _train_mlm(
     group_loss_weight = 0
     optimizer.zero_grad(set_to_none=True)
     for step, (input_ids, attention_mask, _) in enumerate(loader):
-        input_ids = input_ids.to(device, non_blocking=non_blocking)
+        masked_ids, labels = _mask_for_mlm(
+            torch, input_ids, attention_mask, tokenizer, mask_prob)
+        masked_ids = masked_ids.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
         attention_mask = attention_mask.to(
             device, non_blocking=non_blocking)
-        masked_ids, labels = _mask_for_mlm(torch, input_ids, attention_mask, tokenizer, mask_prob)
         with _autocast_context(torch, device, torch_dtype):
             logits = model(masked_ids, attention_mask, task="mlm")
             _require_finite_tensor(torch, logits, "MLM logits")
@@ -1214,7 +1561,8 @@ def _train_mlm(
 def run_paper_experiment(args, spec, splits, fit_tokenizer):
     validate_paper_args(args, spec)
     torch = _torch()
-    preset = paper_training_options(args)
+    preset = paper_training_options(args, spec)
+    validate_paper_training_options(preset, spec)
     seeds = paper_run_seeds(args)
     if not splits["train"]:
         raise ValueError("Paper protocol refuses an empty training split.")
@@ -1225,7 +1573,9 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
         or (Path(args.data_root) / ".graph_tokenizer_cache")
     )
     encoded_cache_key = _encoded_splits_cache_key(
-        tokenizer, splits, int(preset["max_position_embeddings"]))
+        tokenizer, splits, int(preset["max_position_embeddings"]),
+        max_sequence_length=int(preset["max_sequence_length"]),
+        num_realizations=int(preset["num_realizations"]))
     encoded_cache_path = (
         cache_root / spec.canonical_name / "encoded"
         / f"{encoded_cache_key}.pkl")
@@ -1236,6 +1586,8 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
         int(preset["max_position_embeddings"]),
         encoded_cache_path,
         encoded_cache_key,
+        max_sequence_length=int(preset["max_sequence_length"]),
+        num_realizations=int(preset["num_realizations"]),
     )
     train_max_length = max(
         (len(sequence) for sequence in encoded["train"]["input_ids"]),
@@ -1312,13 +1664,20 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
             "pad_token_id": tokenizer.special_tokens.pad_token_id,
             "num_workers": getattr(args, "num_workers", 0),
             "pin_memory": device.type == "cuda",
+            "tokenizer": tokenizer,
+            "max_sequence_length": int(preset["max_sequence_length"]),
         }
+        pretrain_loader = _make_loader(
+            torch, encoded["train"], micro_batch_size, shuffle=True,
+            bucket_by_length=True, group_by_graph=True,
+            augmentation_stage="pretrain", **loader_options)
         train_loader = _make_loader(
             torch, encoded["train"], micro_batch_size, shuffle=True,
-            bucket_by_length=True, **loader_options)
+            bucket_by_length=True, group_by_graph=True,
+            augmentation_stage="finetune", **loader_options)
         val_loader = _make_loader(
             torch, encoded["val"], micro_batch_size, shuffle=False,
-            bucket_by_length=False, **loader_options)
+            bucket_by_length=False, group_by_graph=True, **loader_options)
 
         optimizer_steps = _optimizer_steps_per_epoch(
             train_loader, accumulation_steps)
@@ -1347,9 +1706,10 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
                 lr=float(preset["pretrain_lr"]),
                 weight_decay=float(preset["weight_decay"]),
             )
-            pretrain_scheduler = _linear_warmup_scheduler(
+            pretrain_scheduler = _warmup_cosine_scheduler(
                 torch, pretrain_optimizer,
-                optimizer_steps * pretrain_epochs,
+                _optimizer_steps_per_epoch(
+                    pretrain_loader, accumulation_steps) * pretrain_epochs,
                 preset["pretrain_warmup_ratio"])
             pretrain_start = 1
             if resume_phase == "pretrain":
@@ -1365,7 +1725,7 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
                     torch.cuda.synchronize(device)
                 started = time.monotonic()
                 mlm_loss = _train_mlm(
-                    torch, model, train_loader, pretrain_optimizer,
+                    torch, model, pretrain_loader, pretrain_optimizer,
                     pretrain_scheduler, tokenizer, device,
                     preset["pretrain_max_grad_norm"], preset["mask_prob"],
                     gradient_accumulation_steps=accumulation_steps,
@@ -1410,7 +1770,7 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
             weight_decay=float(preset["weight_decay"]),
         )
         finetune_epochs = int(preset["finetune_epochs"])
-        scheduler = _linear_warmup_scheduler(
+        scheduler = _warmup_cosine_scheduler(
             torch, optimizer,
             optimizer_steps * finetune_epochs,
             preset["finetune_warmup_ratio"])
@@ -1450,7 +1810,8 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
                 loss_name=training_loss_name,
                 pos_weight=molhiv_pos_weight,
                 torch_dtype=precision["torch_dtype"],
-                grad_scaler=grad_scaler)
+                grad_scaler=grad_scaler,
+                gaussian_noise=preset["gaussian_noise"])
             validation = _evaluate(
                 torch, model, val_loader, spec, device, normalizer,
                 torch_dtype=precision["torch_dtype"])
@@ -1524,7 +1885,7 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
             torch_dtype=precision["torch_dtype"])
         test_loader = _make_loader(
             torch, encoded["test"], micro_batch_size, shuffle=False,
-            bucket_by_length=False, **loader_options)
+            bucket_by_length=False, return_graph_ids=True, **loader_options)
         final_test = _evaluate(
             torch, model, test_loader, spec, device, state["normalizer"],
             torch_dtype=precision["torch_dtype"])

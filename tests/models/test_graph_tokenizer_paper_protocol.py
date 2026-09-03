@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,6 +80,7 @@ def test_paper_protocol_constructs_native_tlx_models(encoder_type):
 
     assert model(input_ids, attention_mask, task="mlm").shape == (1, 4, 24)
     assert model(input_ids, attention_mask, task="supervised").shape == (1, 2)
+    assert model(input_ids, attention_mask, task="pooled").shape == (1, 16)
     assert model.manifest()["encoder_type"] == encoder_type
 
 
@@ -136,7 +138,7 @@ def test_paper_protocol_rejects_non_fp32_model_parameters():
         protocol._require_fp32_parameters(torch, model)
 
 
-def test_paper_protocol_accepts_qm9_multi_target_without_target_property():
+def test_paper_protocol_defaults_qm9_to_paper_homo_target():
     protocol = _load_paper_protocol_module()
     args = SimpleNamespace(dataset="qm9", target_property=None, runs=5, seed=42)
 
@@ -153,11 +155,18 @@ def test_paper_protocol_rejects_nonofficial_bert_position_limit():
         protocol.validate_paper_args(args, QM9_SPEC)
 
 
-def test_paper_protocol_rejects_legacy_qm9_single_target_selection():
+def test_paper_protocol_accepts_explicit_qm9_homo_target():
     protocol = _load_paper_protocol_module()
     args = SimpleNamespace(dataset="qm9", target_property="homo", runs=5, seed=42)
 
-    with pytest.raises(ValueError, match="16-target"):
+    protocol.validate_paper_args(args, QM9_SPEC)
+
+
+def test_paper_protocol_rejects_nonpaper_qm9_target():
+    protocol = _load_paper_protocol_module()
+    args = SimpleNamespace(dataset="qm9", target_property="lumo", runs=5, seed=42)
+
+    with pytest.raises(ValueError, match="HOMO"):
         protocol.validate_paper_args(args, QM9_SPEC)
 
 
@@ -196,30 +205,27 @@ def test_paper_runtime_versions_reject_nonpaper_stack(field, wrong_value):
         protocol.validate_paper_runtime_versions(versions)
 
 
-def test_scaler_fit_uses_train_only():
+def test_qm9_scaler_fits_train_homo_only():
     protocol = _load_paper_protocol_module()
-    spec = SimpleNamespace(
-        canonical_name="qm9",
-        output_dim=2,
-        label_keys=("first", "second"),
-    )
+    spec = SimpleNamespace(canonical_name="qm9", output_dim=3,
+                           label_keys=("first", "homo", "third"))
     encoded = {
-        "train": {"labels": [[1.0, 10.0], [3.0, 14.0]]},
-        "val": {"labels": [[5.0, 18.0]]},
-        "test": {"labels": [[0.0, 8.0]]},
+        "train": {"labels": [[1.0, 10.0, 100.0], [3.0, 14.0, 200.0]]},
+        "val": {"labels": [[5.0, 18.0, 300.0]]},
+        "test": {"labels": [[0.0, 8.0, 400.0]]},
     }
 
     normalizer, output_dim = protocol._prepare_labels(encoded, spec, None)
 
-    assert output_dim == 2
+    assert output_dim == 1
     assert normalizer == {
-        "mean": [2.0, 12.0],
-        "std": [1.0, 2.0],
-        "target_properties": ["first", "second"],
+        "mean": [12.0],
+        "std": [2.0],
+        "target_properties": ["homo"],
     }
-    assert encoded["train"]["labels"] == [[-1.0, -1.0], [1.0, 1.0]]
-    assert encoded["val"]["labels"] == [[3.0, 3.0]]
-    assert encoded["test"]["labels"] == [[-2.0, -2.0]]
+    assert encoded["train"]["labels"] == [[-1.0], [1.0]]
+    assert encoded["val"]["labels"] == [[3.0]]
+    assert encoded["test"]["labels"] == [[-2.0]]
     semantics = protocol._metric_semantics(spec, normalizer)
     assert semantics["loss_space"] == "standardized"
     assert semantics["metric_space"] == "raw"
@@ -245,7 +251,7 @@ def test_qm9_denormalization_restores_each_target_on_tensor_device():
 @pytest.mark.parametrize(
     ("canonical_name", "expected"),
     [("molhiv", ("logits", "probability", "none")),
-     ("peptides-struct", ("raw", "raw", "none"))],
+     ("peptides-struct", ("standardized", "raw", "train_split_zscore"))],
 )
 def test_non_qm9_metric_spaces_are_dataset_specific(canonical_name, expected):
     protocol = _load_paper_protocol_module()
@@ -260,7 +266,7 @@ def test_qm9_prepare_labels_rejects_incorrect_target_width():
     spec = SimpleNamespace(
         canonical_name="qm9",
         output_dim=2,
-        label_keys=("first", "second"),
+        label_keys=("homo", "second"),
     )
     encoded = {
         "train": {"labels": [[1.0, 10.0], [3.0, 14.0]]},
@@ -277,7 +283,7 @@ def test_qm9_prepare_labels_rejects_nonfinite_targets():
     spec = SimpleNamespace(
         canonical_name="qm9",
         output_dim=2,
-        label_keys=("first", "second"),
+        label_keys=("first", "homo"),
     )
     encoded = {
         "train": {"labels": [[1.0, 10.0], [3.0, float("nan")]]},
@@ -287,6 +293,29 @@ def test_qm9_prepare_labels_rejects_nonfinite_targets():
 
     with pytest.raises(ValueError, match="non-finite target"):
         protocol._prepare_labels(encoded, spec, None)
+
+
+def test_peptides_struct_scaler_fits_each_target_on_train_only():
+    protocol = _load_paper_protocol_module()
+    spec = SimpleNamespace(
+        canonical_name="peptides-struct", output_dim=2,
+        label_keys=("first", "second"))
+    encoded = {
+        "train": {"labels": [[1.0, 10.0], [3.0, 14.0]]},
+        "val": {"labels": [[5.0, 18.0]]},
+        "test": {"labels": [[float("nan"), 8.0]]},
+    }
+
+    normalizer, output_dim = protocol._prepare_labels(encoded, spec, None)
+
+    assert output_dim == 2
+    assert normalizer == {
+        "mean": [2.0, 12.0], "std": [1.0, 2.0],
+        "target_properties": ["first", "second"]}
+    assert encoded["train"]["labels"] == [[-1.0, -1.0], [1.0, 1.0]]
+    assert encoded["val"]["labels"] == [[3.0, 3.0]]
+    assert math.isnan(encoded["test"]["labels"][0][0])
+    assert encoded["test"]["labels"][0][1] == -2.0
 
 
 def test_paper_protocol_uses_five_seeds_from_42_when_runs_is_unspecified():
@@ -316,6 +345,11 @@ def test_paper_training_options_are_read_from_argparse_namespace():
         mask_prob=0.09,
         patience=20,
         max_position_embeddings=8192,
+        num_merges=2000,
+        min_frequency=2,
+        num_realizations=100,
+        aggregation_mode="avg",
+        pooling="mean",
         paper_amp="bf16",
         paper_tf32=True,
         paper_loss="huber",
@@ -340,11 +374,49 @@ def test_paper_training_options_are_read_from_argparse_namespace():
         "mask_prob": 0.09,
         "patience": 20,
         "max_position_embeddings": 8192,
+        "max_sequence_length": 8096,
+        "num_merges": 2000,
+        "min_frequency": 2,
+        "num_realizations": 100,
+        "aggregation_mode": "avg",
+        "pooling": "mean",
         "amp_dtype": "bf16",
         "allow_tf32": True,
         "training_loss": "huber",
         "molhiv_pos_weight": True,
     }
+
+
+def test_strict_paper_options_match_pinned_qm9_gte_protocol():
+    protocol = _load_paper_protocol_module()
+    args = SimpleNamespace(
+        model="gte", serialization="feuler", pretrain_epoch=200,
+        n_epoch=200, pretrain_lr=5e-5, lr=1e-5, batch_size=32,
+        weight_decay=0.1, pretrain_warmup_ratio=0.12,
+        finetune_warmup_ratio=0.025, pretrain_max_grad_norm=2.0,
+        finetune_max_grad_norm=0.5, mask_prob=0.09, patience=20,
+        max_position_embeddings=8192, num_merges=2000, min_frequency=2,
+        num_realizations=100, aggregation_mode="avg", pooling="mean",
+        paper_amp=None, paper_tf32=None, paper_loss=None,
+        molhiv_pos_weight=None)
+    options = protocol.paper_training_options(args, QM9_SPEC)
+
+    protocol.validate_paper_training_options(options, QM9_SPEC)
+
+    assert options["source_revision"] == "98343a6b025a48fbb6859cd812a12b81ec3ac3cc"
+    assert options["max_sequence_length"] == 8096
+    assert options["gaussian_noise"] == {"probability": 0.3, "std": 0.01}
+    assert options["token_augmentation"]["pretrain"] == {
+        "random_swap": {"probability": 0.5, "ratio": 0.1, "window_size": 3}}
+
+
+def test_strict_paper_options_reject_nonpaper_hyperparameter():
+    protocol = _load_paper_protocol_module()
+    options = protocol.paper_reference_options(QM9_SPEC, "bert")
+    options["mask_prob"] = 0.15
+
+    with pytest.raises(ValueError, match="mask_prob"):
+        protocol.validate_paper_training_options(options, QM9_SPEC)
 
 
 def test_validation_not_used_for_training():
@@ -372,32 +444,40 @@ def test_paper_regression_loss_backpropagates_from_half_precision_logits():
     assert logits.grad is not None
 
 
-def test_optional_regression_losses_leave_paper_default_unchanged():
+def test_peptides_struct_paper_default_is_l1():
     protocol = _load_paper_protocol_module()
     spec = SimpleNamespace(canonical_name="peptides-struct")
     logits = torch.tensor([[3.0, 2.0]])
     labels = torch.tensor([[0.0, float("nan")]])
 
     default = protocol._loss(torch, logits, labels, spec)
-    l1 = protocol._loss(torch, logits, labels, spec, loss_name="l1")
-    huber = protocol._loss(torch, logits, labels, spec, loss_name="huber")
-
-    assert default.item() == 9.0
-    assert l1.item() == 3.0
-    assert huber.item() == 2.5
+    assert default.item() == 3.0
 
 
-def test_optional_molhiv_positive_weight_changes_positive_example_loss():
+def test_molhiv_paper_default_is_two_class_cross_entropy():
     protocol = _load_paper_protocol_module()
     spec = SimpleNamespace(canonical_name="molhiv")
-    logits = torch.tensor([[0.0]])
+    logits = torch.tensor([[0.0, 1.0]])
     labels = torch.tensor([[1.0]])
 
-    unweighted = protocol._loss(torch, logits, labels, spec)
-    weighted = protocol._loss(
-        torch, logits, labels, spec, pos_weight=torch.tensor(3.0))
+    loss = protocol._loss(torch, logits, labels, spec)
 
-    assert weighted.item() == pytest.approx(unweighted.item() * 3.0)
+    assert loss.item() == pytest.approx(
+        torch.nn.functional.cross_entropy(logits, torch.tensor([1])).item())
+
+
+def test_paper_scheduler_uses_cosine_decay_with_one_percent_floor():
+    protocol = _load_paper_protocol_module()
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = protocol._warmup_cosine_scheduler(
+        torch, optimizer, total_steps=10, warmup_ratio=0.2)
+
+    multipliers = [scheduler.lr_lambdas[0](step) for step in (0, 1, 2, 6, 10)]
+
+    assert multipliers[:3] == pytest.approx([0.5, 1.0, 1.0])
+    assert multipliers[3] == pytest.approx(0.505)
+    assert multipliers[4] == pytest.approx(0.01)
 
 
 def test_precision_options_reject_cuda_amp_on_cpu():
@@ -446,7 +526,7 @@ def test_paper_metric_details_report_each_qm9_target_mae():
     }
 
 
-def test_paper_mlm_mask_forces_one_token_when_random_selection_is_empty(monkeypatch):
+def test_paper_mlm_mask_uses_official_80_10_10_replacement(monkeypatch):
     protocol = _load_paper_protocol_module()
     tokenizer = SimpleNamespace(special_tokens=SimpleNamespace(
         pad_token_id=0,
@@ -454,25 +534,77 @@ def test_paper_mlm_mask_forces_one_token_when_random_selection_is_empty(monkeypa
         sep_token_id=2,
         component_sep_token_id=3,
         mask_token_id=4,
+    ), max_token_id=31)
+    input_ids = torch.tensor([[1, 5, 6, 7, 2, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 0]])
+    draws = iter((
+        torch.tensor([[0, 1, 1, 1, 0, 0]]),
+        torch.tensor([[0, 1, 0, 0, 0, 0]]),
+        torch.tensor([[0, 0, 1, 0, 0, 0]]),
     ))
-    input_ids = torch.tensor([[1, 5, 6, 3, 7, 2, 0]])
-    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0]])
     monkeypatch.setattr(
-        torch,
-        "rand_like",
-        lambda tensor, dtype: torch.ones_like(tensor, dtype=dtype),
-    )
+        torch, "bernoulli", lambda values: next(draws))
+    monkeypatch.setattr(
+        torch, "randint",
+        lambda size, shape, dtype, device: torch.full(
+            shape, 20, dtype=dtype, device=device))
 
     masked_ids, labels = protocol._mask_for_mlm(
         torch, input_ids, attention_mask, tokenizer, mask_prob=0.09)
 
-    selected = labels.ne(-100)
-    maskable = torch.tensor([[False, True, True, False, True, False, False]])
-    assert selected.sum().item() == 1
-    assert torch.all(selected <= maskable)
-    assert torch.equal(labels[selected], input_ids[selected])
-    assert torch.all(masked_ids[selected].eq(tokenizer.special_tokens.mask_token_id))
-    assert torch.equal(masked_ids[~selected], input_ids[~selected])
+    assert labels.tolist() == [[-100, 5, 6, 7, -100, -100]]
+    assert masked_ids.tolist() == [[1, 4, 20, 7, 2, 0]]
+
+
+def test_pretrain_token_augmentation_matches_paper_random_swap(monkeypatch):
+    protocol = _load_paper_protocol_module()
+    monkeypatch.setattr(protocol.random, "random", lambda: 0.0)
+    monkeypatch.setattr(protocol.random, "randint", lambda start, end: 5)
+    monkeypatch.setattr(
+        protocol.random, "sample", lambda positions, count: [4, 6])
+
+    augmented = protocol._augment_serialized_tokens(
+        list(range(10)), stage="pretrain", mask_token_id=2)
+
+    assert augmented == [0, 1, 2, 3, 6, 5, 4, 7, 8, 9]
+
+
+def test_finetune_token_augmentation_adds_swap_and_sequence_mask(monkeypatch):
+    protocol = _load_paper_protocol_module()
+    samples = iter(([4, 6], [3]))
+    monkeypatch.setattr(protocol.random, "random", lambda: 0.0)
+    monkeypatch.setattr(protocol.random, "randint", lambda start, end: 5)
+    monkeypatch.setattr(
+        protocol.random, "sample", lambda positions, count: list(next(samples)))
+
+    augmented = protocol._augment_serialized_tokens(
+        list(range(20)), stage="finetune", mask_token_id=99)
+
+    assert augmented[3] == 99
+    assert augmented[4] == 6
+    assert augmented[6] == 4
+
+
+def test_supervised_training_noise_is_applied_to_pooled_features(monkeypatch):
+    protocol = _load_paper_protocol_module()
+
+    class PooledModel(torch.nn.Module):
+        def forward(self, input_ids, attention_mask, task):
+            assert task == "pooled"
+            return torch.ones((len(input_ids), 2))
+
+        @staticmethod
+        def _task_logits(pooled):
+            return pooled
+
+    monkeypatch.setattr(protocol.random, "random", lambda: 0.0)
+    monkeypatch.setattr(torch, "randn_like", lambda values: torch.ones_like(values))
+
+    logits = protocol._forward_supervised(
+        torch, PooledModel(), torch.tensor([[1]]), torch.tensor([[1]]),
+        gaussian_noise={"probability": 0.3, "std": 0.01})
+
+    assert torch.equal(logits, torch.full((1, 2), 1.01))
 
 
 def test_mlm_training_switches_tensorlayerx_model_to_train_mode():
@@ -496,7 +628,7 @@ def test_mlm_training_switches_tensorlayerx_model_to_train_mode():
         sep_token_id=2,
         component_sep_token_id=3,
         mask_token_id=4,
-    ))
+    ), max_token_id=7)
     model = TLXModeModel()
     loader = [(
         torch.tensor([[1, 5, 2]]),
@@ -512,7 +644,7 @@ def test_mlm_training_switches_tensorlayerx_model_to_train_mode():
         tokenizer,
         torch.device("cpu"),
         max_grad_norm=10.0,
-        mask_prob=0.09,
+        mask_prob=1.0,
     )
 
     assert model.is_train is True
@@ -594,28 +726,27 @@ def test_amp_evaluation_casts_predictions_to_fp32_before_denormalizing(
     assert dtypes == [torch.float32, torch.float32]
 
 
-def test_qm9_evaluation_uses_standardized_mae_and_keeps_raw_diagnostics():
+def test_qm9_evaluation_reports_only_raw_homo_mae():
     protocol = _load_paper_protocol_module()
 
     class ZeroModel(torch.nn.Module):
         def forward(self, input_ids, attention_mask, task):
-            return torch.zeros((len(input_ids), 2), dtype=torch.float32)
+            return torch.zeros((len(input_ids), 1), dtype=torch.float32)
 
     result = protocol._evaluate(
         torch,
         ZeroModel(),
         [(torch.tensor([[1]]), torch.tensor([[1]]),
-          torch.tensor([[1.0, 1.0]]))],
-        SimpleNamespace(
-            canonical_name="qm9", label_keys=("first", "second")),
+          torch.tensor([[1.0]]))],
+        SimpleNamespace(canonical_name="qm9", label_keys=QM9_SPEC.label_keys),
         torch.device("cpu"),
-        normalizer={"mean": [100.0, 1000.0], "std": [10.0, 100.0]},
+        normalizer={"mean": [100.0], "std": [10.0],
+                    "target_properties": ["homo"]},
     )
 
-    assert result["metric"] == 55.0
+    assert result["metric"] == 10.0
     assert result["metric_space"] == "raw"
-    assert result["per_target_mae"] == {"first": 1.0, "second": 1.0}
-    assert result["per_target_mae_raw"] == {"first": 10.0, "second": 100.0}
+    assert result["per_target_mae"] == {"homo": 10.0}
 
 
 def test_paper_encoding_keeps_ragged_sequences_until_batch_collation():
@@ -646,6 +777,56 @@ def test_paper_encoding_keeps_ragged_sequences_until_batch_collation():
         [3, 9, 10, 11, 4],
     ]
     assert "attention_mask" not in encoded["train"]
+
+
+def test_paper_encoding_builds_up_to_100_variants_per_graph_and_tracks_ids():
+    protocol = _load_paper_protocol_module()
+
+    class Tokenizer:
+        special_tokens = SimpleNamespace(sep_token_id=4)
+
+        @staticmethod
+        def encode_graph(graph, start_node=None):
+            return SimpleNamespace(
+                input_ids=[3, 8 + int(start_node), 4],
+                serialized_token_ids=[8 + int(start_node)])
+
+    graph = SimpleNamespace(num_nodes=3, y=[1.0])
+    splits = {"train": [graph], "val": [graph], "test": [graph]}
+
+    encoded, maximum = protocol._encode_splits(
+        Tokenizer(), splits, max_position_embeddings=8096,
+        max_sequence_length=768, num_realizations=100)
+
+    assert maximum == 3
+    assert encoded["train"]["input_ids"] == [
+        [3, 8, 4], [3, 9, 4], [3, 10, 4]]
+    assert encoded["train"]["serialized_token_ids"] == [[8], [9], [10]]
+    assert encoded["train"]["labels"] == [[1.0], [1.0], [1.0]]
+    assert encoded["train"]["graph_ids"] == [0, 0, 0]
+
+
+def test_paper_bert_truncates_to_768_and_preserves_sep():
+    protocol = _load_paper_protocol_module()
+
+    class Tokenizer:
+        special_tokens = SimpleNamespace(sep_token_id=4)
+
+        @staticmethod
+        def encode_graph(graph, start_node=None):
+            return SimpleNamespace(
+                input_ids=list(graph.tokens), serialized_token_ids=[])
+
+    graph = SimpleNamespace(num_nodes=1, tokens=[3, *range(1000), 4], y=[1.0])
+    splits = {"train": [graph], "val": [graph], "test": [graph]}
+
+    encoded, maximum = protocol._encode_splits(
+        Tokenizer(), splits, max_position_embeddings=8096,
+        max_sequence_length=768, num_realizations=1)
+
+    assert maximum == 768
+    assert len(encoded["train"]["input_ids"][0]) == 768
+    assert encoded["train"]["input_ids"][0][-1] == 4
 
 
 def test_paper_encoded_splits_reuse_local_cache_without_reserializing(tmp_path):
@@ -764,6 +945,50 @@ def test_paper_loader_pads_only_to_each_batch_maximum():
     assert second_ids.tolist() == [[3, 4]]
     assert second_mask.tolist() == [[1, 1]]
     assert second_labels.tolist() == [[3.0]]
+
+
+def test_paper_loader_selects_one_random_variant_per_graph():
+    protocol = _load_paper_protocol_module()
+    split = {
+        "input_ids": [[3, 8, 4], [3, 9, 4], [3, 10, 4], [3, 11, 4]],
+        "labels": [[1.0], [1.0], [2.0], [2.0]],
+        "graph_ids": [7, 7, 8, 8],
+    }
+
+    loader = protocol._make_loader(
+        torch, split, batch_size=2, shuffle=False, group_by_graph=True,
+        return_graph_ids=True, bucket_by_length=False)
+    _, _, labels, graph_ids = next(iter(loader))
+
+    assert len(loader.dataset) == 2
+    assert labels.reshape(-1).tolist() == [1.0, 2.0]
+    assert graph_ids.tolist() == [7, 8]
+
+
+def test_paper_evaluation_averages_variants_by_graph_before_mae():
+    protocol = _load_paper_protocol_module()
+
+    class TokenValueModel(torch.nn.Module):
+        def forward(self, input_ids, attention_mask, task):
+            return input_ids[:, 1:2].float()
+
+    split = {
+        "input_ids": [[3, 0, 4], [3, 2, 4], [3, 4, 4], [3, 6, 4]],
+        "labels": [[1.0], [1.0], [5.0], [5.0]],
+        "graph_ids": [7, 7, 8, 8],
+    }
+    loader = protocol._make_loader(
+        torch, split, batch_size=4, shuffle=False, return_graph_ids=True,
+        bucket_by_length=False)
+
+    result = protocol._evaluate(
+        torch, TokenValueModel(), loader,
+        SimpleNamespace(canonical_name="qm9", label_keys=("homo",)),
+        torch.device("cpu"), normalizer=None)
+
+    assert result["metric"] == 0.0
+    assert result["num_graphs"] == 2
+    assert result["num_sequences"] == 4
 
 
 def test_dataloader_worker_seed_does_not_consume_model_rng():
@@ -1300,7 +1525,7 @@ def test_tiny_paper_protocol_runs_pretrain_finetune_and_five_runs(
         def __init__(self):
             super().__init__()
             self.embedding = torch.nn.Embedding(32, 4)
-            self.task_head = torch.nn.Linear(4, 16)
+            self.task_head = torch.nn.Linear(4, 1)
             self.mlm_head = torch.nn.Linear(4, 32)
 
         def forward(self, input_ids, attention_mask, task):
@@ -1337,7 +1562,13 @@ def test_tiny_paper_protocol_runs_pretrain_finetune_and_five_runs(
 
         @staticmethod
         def encode_graph(graph):
-            return SimpleNamespace(input_ids=list(graph.tokens))
+            return SimpleNamespace(
+                input_ids=list(graph.tokens),
+                serialized_token_ids=list(graph.tokens[1:-1]))
+
+        @staticmethod
+        def encode_tokens(tokens):
+            return [1, *tokens, 2]
 
     labels = [float(index) for index in range(16)]
 
@@ -1381,12 +1612,18 @@ def test_tiny_paper_protocol_runs_pretrain_finetune_and_five_runs(
         "finetune_warmup_ratio": 0.025,
         "pretrain_max_grad_norm": 2.0,
         "finetune_max_grad_norm": 0.5,
-        "mask_prob": 0.09,
+        "mask_prob": 1.0,
         "max_position_embeddings": 16,
+        "max_sequence_length": 16,
+        "num_realizations": 1,
+        "aggregation_mode": "avg",
+        "gaussian_noise": {"probability": 0.3, "std": 0.01},
     }
     monkeypatch.setattr(protocol, "_torch", lambda: torch)
     monkeypatch.setattr(
-        protocol, "paper_training_options", lambda _args: training_options)
+        protocol, "paper_training_options", lambda _args, _spec: training_options)
+    monkeypatch.setattr(
+        protocol, "validate_paper_training_options", lambda _options, _spec: None)
     model_configs = []
 
     def create_tiny_model(**kwargs):

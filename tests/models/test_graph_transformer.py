@@ -827,9 +827,9 @@ def test_graph_tokenizer_trainer_formats_result_rows_and_aggregates_runs():
         "primary_metric": "auc",
         "higher_is_better": True,
         "val_auc_mean": 0.8500000000000001,
-        "val_auc_std": 0.04999999999999999,
+        "val_auc_std": pytest.approx(0.07071067811865474),
         "test_auc_mean": 0.8,
-        "test_auc_std": 0.10000000000000003,
+        "test_auc_std": pytest.approx(0.14142135623730953),
     }
 
 
@@ -850,12 +850,12 @@ def test_graph_tokenizer_aggregates_per_target_mae_across_runs():
 
     assert aggregate == {
         "val": {
-            "mu": {"mean": 2.0, "std": 1.0},
-            "alpha": {"mean": 4.0, "std": 1.0},
+            "mu": {"mean": 2.0, "std": pytest.approx(2 ** 0.5)},
+            "alpha": {"mean": 4.0, "std": pytest.approx(2 ** 0.5)},
         },
         "test": {
-            "mu": {"mean": 3.0, "std": 1.0},
-            "alpha": {"mean": 5.0, "std": 1.0},
+            "mu": {"mean": 3.0, "std": pytest.approx(2 ** 0.5)},
+            "alpha": {"mean": 5.0, "std": pytest.approx(2 ** 0.5)},
         },
     }
 
@@ -875,8 +875,8 @@ def test_graph_tokenizer_aggregates_raw_per_target_mae_across_runs():
 
     assert trainer.aggregate_per_target_mae(
         runs, field_name="per_target_mae_raw") == {
-            "val": {"mu": {"mean": 20.0, "std": 10.0}},
-            "test": {"mu": {"mean": 30.0, "std": 10.0}},
+            "val": {"mu": {"mean": 20.0, "std": pytest.approx(200 ** 0.5)}},
+            "test": {"mu": {"mean": 30.0, "std": pytest.approx(200 ** 0.5)}},
         }
 
 

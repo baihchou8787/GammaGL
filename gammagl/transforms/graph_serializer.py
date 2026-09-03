@@ -1,6 +1,6 @@
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 @dataclass
@@ -46,14 +46,23 @@ class FrequencyGuidedEulerianSerializer:
         self.frequency_map = dict(counts)
         return self
 
-    def serialize(self, graph: Any) -> GraphSerializationResult:
+    def serialize(
+            self, graph: Any, start_node: Optional[int] = None
+    ) -> GraphSerializationResult:
         graph_view = self._read_graph(graph)
+        if start_node is not None:
+            start_node = int(start_node)
+            if not 0 <= start_node < graph_view["num_nodes"]:
+                raise ValueError("start_node must identify a node in the graph.")
         components = self._connected_components(graph_view["num_nodes"], graph_view["arcs"])
         component_results = []
 
         for component in components:
-            edges = self._serialize_component(graph_view, component)
-            tokens = self._edges_to_tokens(graph_view, edges, component)
+            component_start = start_node if start_node in component else None
+            edges = self._serialize_component(
+                graph_view, component, start_node=component_start)
+            tokens = self._edges_to_tokens(
+                graph_view, edges, component, start_node=component_start)
             component_results.append((
                 tokens,
                 len(edges),
@@ -76,6 +85,7 @@ class FrequencyGuidedEulerianSerializer:
                 "num_components": len(component_results),
                 "num_edges_traversed": sum(
                     edge_count for _, edge_count, _ in component_results),
+                "start_node": start_node,
             },
         )
 
@@ -338,7 +348,9 @@ class FrequencyGuidedEulerianSerializer:
             components.append(component)
         return components
 
-    def _serialize_component(self, graph_view: Dict[str, Any], component: Sequence[int]) -> List[Tuple[int, int, int]]:
+    def _serialize_component(
+            self, graph_view: Dict[str, Any], component: Sequence[int],
+            start_node: Optional[int] = None) -> List[Tuple[int, int, int]]:
         component_nodes = set(component)
         arcs = [
             (src, dst, label)
@@ -356,8 +368,12 @@ class FrequencyGuidedEulerianSerializer:
                 -item[3], item[1], graph_view["node_signatures"][item[0]]))
             adjacency[src].reverse()
 
-        start = self._select_structural_node(
-            graph_view, (node for node in component if adjacency.get(node)))
+        start = (
+            int(start_node) if start_node is not None
+            else self._select_structural_node(
+                graph_view, (node for node in component if adjacency.get(node))))
+        if not adjacency.get(start):
+            raise ValueError("start_node has no edge in this component.")
         used = set()
         circuit: List[Tuple[int, int, int]] = []
         node_stack = [start]
@@ -466,10 +482,13 @@ class FrequencyGuidedEulerianSerializer:
         graph_view: Dict[str, Any],
         edges: Sequence[Tuple[int, int, int]],
         component: Sequence[int],
+        start_node: Optional[int] = None,
     ) -> List[int]:
         if not edges:
             return self._node_tokens(
-                graph_view, self._select_structural_node(graph_view, component))
+                graph_view,
+                int(start_node) if start_node is not None
+                else self._select_structural_node(graph_view, component))
 
         tokens = self._node_tokens(graph_view, edges[0][0])
         for _, dst, edge_label in edges:
@@ -527,6 +546,7 @@ class EulerianSerializer(FrequencyGuidedEulerianSerializer):
         self,
         graph_view: Dict[str, Any],
         component: Sequence[int],
+        start_node: Optional[int] = None,
     ) -> List[Tuple[int, int, int]]:
         component_nodes = set(component)
         arcs = [
@@ -546,8 +566,12 @@ class EulerianSerializer(FrequencyGuidedEulerianSerializer):
                 reverse=True,
             )
 
-        start = self._select_structural_node(
-            graph_view, (node for node in component if adjacency.get(node)))
+        start = (
+            int(start_node) if start_node is not None
+            else self._select_structural_node(
+                graph_view, (node for node in component if adjacency.get(node))))
+        if not adjacency.get(start):
+            raise ValueError("start_node has no edge in this component.")
         node_stack = [start]
         edge_stack: List[Tuple[int, int, int]] = []
         circuit: List[Tuple[int, int, int]] = []

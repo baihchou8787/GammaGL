@@ -344,12 +344,15 @@ def mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else float("nan")
 
 
-def population_std(values: Sequence[float]) -> float:
+def sample_std(values: Sequence[float]) -> float:
     values = [float(value) for value in values if not math.isnan(float(value))]
     if not values:
         return float("nan")
+    if len(values) == 1:
+        return 0.0
     avg = sum(values) / len(values)
-    return math.sqrt(sum((value - avg) ** 2 for value in values) / len(values))
+    return math.sqrt(
+        sum((value - avg) ** 2 for value in values) / (len(values) - 1))
 
 
 def format_result_row(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -382,9 +385,9 @@ def aggregate_run_summaries(spec: DatasetSpec, summaries: Sequence[Dict[str, Any
         "primary_metric": metric_name,
         "higher_is_better": higher_is_better(spec),
         f"val_{metric_name}_mean": mean(val_values),
-        f"val_{metric_name}_std": population_std(val_values),
+        f"val_{metric_name}_std": sample_std(val_values),
         f"test_{metric_name}_mean": mean(test_values),
-        f"test_{metric_name}_std": population_std(test_values),
+        f"test_{metric_name}_std": sample_std(test_values),
     }
 
 
@@ -410,7 +413,7 @@ def aggregate_per_target_mae(
             ]
             aggregated[output_name][target_name] = {
                 "mean": mean(values),
-                "std": population_std(values),
+                "std": sample_std(values),
             }
     return aggregated
 
@@ -675,7 +678,7 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
         )
         digest = hashlib.sha256()
         cache_config = {
-            "cache_version": 2,
+            "cache_version": 3,
             "dataset": str(args.dataset),
             "model": str(getattr(args, "model", None)),
             "serialization": serialization,
@@ -683,6 +686,7 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
             "min_frequency": int(args.min_frequency),
             "bpe_backend": str(args.bpe_backend),
             "num_train_graphs": len(train_graphs),
+            "num_realizations": int(getattr(args, "num_realizations", 100)),
         }
         digest.update(json.dumps(
             cache_config, sort_keys=True, separators=(",", ":")
@@ -701,7 +705,7 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
                 with cache_path.open("rb") as handle:
                     cached = pickle.load(handle)
                 if (
-                        cached.get("cache_version") == 2
+                        cached.get("cache_version") == 3
                         and cached.get("cache_key") == cache_key):
                     tokenizer = cached["tokenizer"]
                     tokenizer._cache_status = "hit"
@@ -716,6 +720,9 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
             getattr(graph, "graph_tokenizer_id", index)
             for index, graph in enumerate(train_graphs)
         ],
+        num_realizations=(
+            int(getattr(args, "num_realizations", 100))
+            if getattr(args, "protocol", None) == "paper" else 1),
     )
     if getattr(args, "protocol", None) == "paper":
         tokenizer._cache_status = "miss"
@@ -726,7 +733,7 @@ def fit_tokenizer(args, train_graphs: Sequence[SyntheticGraph]):
             f".{cache_path.name}.tmp-{os.getpid()}")
         with temporary.open("wb") as handle:
             pickle.dump({
-                "cache_version": 2,
+                "cache_version": 3,
                 "cache_key": cache_key,
                 "tokenizer": tokenizer,
             }, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1264,7 +1271,11 @@ def preflight_check(args) -> Dict[str, Any]:
         try:
             if getattr(args, "protocol", "gammagl") == "paper":
                 protocol = load_paper_protocol_module()
-                protocol.validate_paper_args(args, resolve_dataset_spec(dataset))
+                paper_spec = resolve_dataset_spec(dataset)
+                protocol.validate_paper_args(args, paper_spec)
+                protocol.validate_paper_training_options(
+                    protocol.paper_training_options(args, paper_spec),
+                    paper_spec)
             report["datasets"].append(preflight_dataset_status(args.data_root, dataset))
         except Exception as error:
             report["datasets"].append(
@@ -1434,8 +1445,6 @@ def run_paper_experiments(args):
                 "metric_space": run["best_val"].get("metric_space"),
                 "per_target_mae": run["best_val"].get(
                     "per_target_mae", {}),
-                "per_target_mae_raw": run["best_val"].get(
-                    "per_target_mae_raw", {}),
             },
             "best_test": {
                 "loss": run["best_test"]["loss"],
@@ -1443,8 +1452,6 @@ def run_paper_experiments(args):
                 "metric_space": run["best_test"].get("metric_space"),
                 "per_target_mae": run["best_test"].get(
                     "per_target_mae", {}),
-                "per_target_mae_raw": run["best_test"].get(
-                    "per_target_mae_raw", {}),
             },
             "checkpoint_path": run["checkpoint_path"],
             "history": run["history"],
@@ -1468,12 +1475,10 @@ def run_paper_experiments(args):
             "primary_metric": primary_metric,
             "higher_is_better": spec.canonical_name == "molhiv",
             f"val_{primary_metric}_mean": mean(val_values),
-            f"val_{primary_metric}_std": population_std(val_values),
+            f"val_{primary_metric}_std": sample_std(val_values),
             f"test_{primary_metric}_mean": mean(values),
-            f"test_{primary_metric}_std": population_std(values),
+            f"test_{primary_metric}_std": sample_std(values),
             "per_target_mae": aggregate_per_target_mae(runs),
-            "per_target_mae_raw": aggregate_per_target_mae(
-                runs, field_name="per_target_mae_raw"),
         },
         "paper": {key: value for key, value in paper_summary.items() if key != "runs"},
         "manifest": {
@@ -1639,7 +1644,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-property",
         default=None,
-        help="Legacy option rejected by strict paper mode, which jointly predicts all 16 QM9 targets.",
+        help="QM9 property; strict paper mode permits only HOMO (the default).",
     )
     parser.add_argument("--device", default="cuda", help="Torch device used by --protocol paper.")
     parser.add_argument(
@@ -1670,6 +1675,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pooling", default="mean", choices=("mean", "cls"))
     parser.add_argument("--num-merges", type=int, default=2000)
     parser.add_argument("--min-frequency", type=int, default=2)
+    parser.add_argument(
+        "--num-realizations", type=int, default=100,
+        help="Paper protocol serializations requested per graph (capped by node count).")
+    parser.add_argument(
+        "--aggregation-mode", default="avg", choices=("avg",),
+        help="Average all serialization-variant predictions per test graph.")
     parser.add_argument("--bpe-backend", default="auto", choices=("python", "auto", "cpp"))
     parser.add_argument("--serialization", default="feuler", choices=("feuler", "eulerian"))
     parser.add_argument("--max-length", type=int, default=128)

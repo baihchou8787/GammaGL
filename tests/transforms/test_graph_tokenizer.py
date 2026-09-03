@@ -238,6 +238,42 @@ def test_feuler_deserializes_from_token_stream_without_graph_metadata():
     assert "input_edges" not in result.metadata
 
 
+def test_feuler_start_node_produces_reversible_graph_variants():
+    FrequencyGuidedEulerianSerializer = (
+        _load_graph_serializer_module().FrequencyGuidedEulerianSerializer)
+    graph = SimpleGraph(
+        edge_index=[[0, 1, 2], [1, 2, 0]],
+        x=[4, 5, 6], edge_attr=[1, 2, 3])
+    serializer = FrequencyGuidedEulerianSerializer().fit([graph])
+
+    from_zero = serializer.serialize(graph, start_node=0)
+    from_one = serializer.serialize(graph, start_node=1)
+
+    assert from_zero.token_ids != from_one.token_ids
+    assert serializer.deserialize(from_zero) == serializer.deserialize(from_one)
+    assert from_zero.metadata["start_node"] == 0
+    assert from_one.metadata["start_node"] == 1
+
+
+def test_graph_tokenizer_fits_bpe_on_requested_graph_realizations():
+    graph_tokenizer = _load_graph_tokenizer_module()
+    graph_bpe = _load_graph_bpe_module()
+    graph = SimpleGraph(
+        edge_index=[[0, 1, 2], [1, 2, 0]],
+        x=[4, 5, 6], edge_attr=[1, 2, 3])
+    tokenizer = graph_tokenizer.GraphTokenizer(
+        bpe=graph_bpe.GraphBPE(num_merges=0))
+
+    tokenizer.fit([graph], graph_ids=[7], num_realizations=100)
+
+    assert tokenizer.fit_num_realizations == 100
+    variants = [
+        tokenizer.encode_graph(graph, start_node=index).input_ids
+        for index in range(3)
+    ]
+    assert len({tuple(sequence) for sequence in variants}) == 3
+
+
 def _canonical_labeled_edges(edge_index, edge_attr):
     labels = edge_attr if edge_attr is not None else [0] * len(edge_index[0])
     return sorted(

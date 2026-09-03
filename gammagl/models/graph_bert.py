@@ -264,14 +264,17 @@ class GraphTokenTransformer(tlx.nn.Module):
         return self.task_head_out(hidden)
 
     def forward(self, input_ids, attention_mask=None, task: str | None = None):
-        if task not in {None, "mlm", "supervised"}:
-            raise ValueError("task must be None, 'mlm', or 'supervised'.")
+        if task not in {None, "mlm", "supervised", "pooled"}:
+            raise ValueError(
+                "task must be None, 'mlm', 'supervised', or 'pooled'.")
         hidden_states = self._embed(input_ids)
         for layer in self.encoder_layers:
             hidden_states = layer(hidden_states, attention_mask=attention_mask)
         if task == "mlm":
             return self.mlm_head(hidden_states)
         pooled_output = self._pool(hidden_states, attention_mask)
+        if task == "pooled":
+            return pooled_output
         if task == "supervised":
             return self._task_logits(pooled_output)
         mlm_logits = self.mlm_head(hidden_states)

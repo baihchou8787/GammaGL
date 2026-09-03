@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 import hashlib
 import random
@@ -67,12 +69,17 @@ class GraphTokenizer(BaseTransform):
         self.vocabulary = {}
         self.id_to_vocabulary_token = {}
         self.fit_graph_ids_hash = None
+        self.fit_num_realizations = 1
         self.schema_version = 1
 
-    def fit(self, graphs, graph_ids=None):
+    def fit(self, graphs, graph_ids=None, num_realizations: int = 1):
         graphs = list(graphs)
         if not graphs:
             raise ValueError("Cannot fit GraphTokenizer on an empty training corpus.")
+        num_realizations = int(num_realizations)
+        if num_realizations <= 0:
+            raise ValueError("num_realizations must be positive.")
+        self.fit_num_realizations = num_realizations
         self.fit_graph_ids_hash = None
         if graph_ids is not None:
             graph_ids = list(graph_ids)
@@ -81,10 +88,13 @@ class GraphTokenizer(BaseTransform):
             self.fit_graph_ids_hash = hashlib.sha256(
                 repr(tuple(graph_ids)).encode("utf-8")).hexdigest()
         self.serializer.fit(graphs)
-        serialized_sequences = [
-            self._normalize_serialized_tokens(self.serializer.serialize(graph).token_ids)
-            for graph in graphs
-        ]
+        serialized_sequences = []
+        for graph in graphs:
+            for start_node in self.realization_start_nodes(
+                    graph, num_realizations):
+                serialized_sequences.append(self._normalize_serialized_tokens(
+                    self.serializer.serialize(
+                        graph, start_node=start_node).token_ids))
         self.bpe.fit(serialized_sequences)
         # Match the official protocol: BPE IDs are an intermediate alphabet,
         # then a frozen train-built contiguous vocabulary maps them to model IDs.
@@ -128,9 +138,11 @@ class GraphTokenizer(BaseTransform):
                 f"Model vocab_size={vocab_size} is smaller than the tokenizer "
                 f"requirement {required_vocab_size}.")
 
-    def encode_graph(self, graph: Any) -> GraphTokenizationResult:
+    def encode_graph(
+            self, graph: Any, start_node: int | None = None
+    ) -> GraphTokenizationResult:
         self._require_fitted()
-        serialized = self.serializer.serialize(graph)
+        serialized = self.serializer.serialize(graph, start_node=start_node)
         serialized_token_ids = self._normalize_serialized_tokens(serialized.token_ids)
         input_ids = self.encode_tokens(serialized_token_ids)
         return GraphTokenizationResult(
@@ -149,6 +161,26 @@ class GraphTokenizer(BaseTransform):
                 "fit_graph_ids_hash": self.fit_graph_ids_hash,
             },
         )
+
+    @staticmethod
+    def realization_start_nodes(graph: Any, num_realizations: int):
+        """Match the paper serializer's evenly spaced start-node variants."""
+        num_realizations = int(num_realizations)
+        if num_realizations <= 0:
+            raise ValueError("num_realizations must be positive.")
+        if num_realizations == 1:
+            return [None]
+        value = (
+            graph.get("num_nodes") if isinstance(graph, dict)
+            else getattr(graph, "num_nodes", None))
+        if callable(value):
+            value = value()
+        total_nodes = int(value)
+        if total_nodes <= 0:
+            return [None]
+        actual_samples = min(num_realizations, total_nodes)
+        step = max(1, total_nodes // actual_samples)
+        return [(index * step) % total_nodes for index in range(actual_samples)]
 
     def decode_graph(self, encoding) -> Dict[str, Any]:
         """Invert BPE and reconstruct a graph from an encoded token sequence."""

@@ -6,7 +6,17 @@
 
 GraphTokenizer 由论文[连接图与 Transformer 的图词元化](https://openreview.net/forum?id=jCctxI1BGF)（ICLR 2026）提出。
 
-论文实验协议采用频率引导的欧拉序列化（Feuler），仅在训练集划分上拟合 Graph BPE，使用掩码语言模型进行预训练，根据验证集性能选择最佳微调检查点，只在测试集上评估一次，并报告五次运行结果的均值和总体标准差。
+论文实验协议固定到官方实现提交
+`98343a6b025a48fbb6859cd812a12b81ec3ac3cc`。它采用频率引导的欧拉序列化
+（Feuler），每图请求 100 个起点变体（不超过节点数），仅在训练集划分上拟合
+Graph BPE。训练和验证按图随机取一个变体，测试对同一图的全部变体预测取平均；
+最佳检查点只由验证集选择，最终报告五次运行的均值和样本标准差（`ddof=1`）。
+
+预训练在 BPE 前使用 RandomSwap；微调在 BPE 前使用 RandomSwap 和
+SequenceMasking，并以 0.3 概率向池化特征加入标准差 0.01 的高斯噪声。学习率
+采用线性 warmup 后余弦衰减，最低为初始学习率的 1%。BERT 的位置嵌入表为
+8096，但与官方数据管线相同，实际输入上限固定为 768；GTE 的模型容量为 8192，
+论文训练管线的实际输入上限为 8096。
 
 Feuler 序列化器在其支持的无向简单图范围内是可逆的。论文中的 GTE
 实验会将版本固定的官方编码器加载到原生 TLX GraphGTE 实现中；图词元嵌入和
@@ -21,9 +31,15 @@ Feuler 仅接受无向简单图：不支持自环和平行边，也不接受显�
 
 以下论文实验命令覆盖三个数据集：
 
-- QM9：联合 16 目标回归，使用 MAE 报告结果。
-- OGBG-molhiv：二分类，使用 OGB ROC-AUC 报告结果。
-- Peptides-struct：11 目标回归，使用平均 MAE 报告结果。
+- QM9：只预测论文默认的 HOMO；训练标签按训练集 z-score 标准化，最终将预测
+  反变换为原始 eV 后计算 MAE。
+- OGBG-molhiv：双 logit、无类别加权的交叉熵，使用 OGB ROC-AUC 报告结果。
+- Peptides-struct：11 目标按训练集逐目标 z-score 标准化，以 L1 训练；评估时
+  反变换到原始标签空间，逐目标计算 MAE 后等权平均。
+
+Peptides-struct 的 MLM 阶段使用与官方 `peptides-func` 相同的肽图语料；两套任务
+的图与划分相同，MLM 不读取下游标签，因此本实现直接复用 Peptides-struct 中等价
+的图数据，并在运行清单中记录 `pretraining_graph_corpus=peptides-func`。
 
 GammaGL 数据集类会在首次使用时下载 GraphTokenizer 官方发布的数据包。下载的
 归档文件会在解压前使用官方公布的 SHA-256 进行校验：
@@ -81,6 +97,7 @@ python third_party/graph_bpe_cpp/setup.py build_ext --inplace
 python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --protocol paper \
     --dataset qm9 \
+    --target-property homo \
     --model bert \
     --serialization feuler \
     --pretrain-epoch 200 \
@@ -100,6 +117,9 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --bpe-backend cpp \
     --paper-cache-root cache/graph_tokenizer \
     --num-merges 2000 \
+    --min-frequency 2 \
+    --num-realizations 100 \
+    --aggregation-mode avg \
     --runs 5 \
     --seed 42 \
     --paper-amp off \
@@ -113,6 +133,7 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
 python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --protocol paper \
     --dataset qm9 \
+    --target-property homo \
     --model gte \
     --serialization feuler \
     --pretrain-epoch 200 \
@@ -132,6 +153,9 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --bpe-backend cpp \
     --paper-cache-root cache/graph_tokenizer \
     --num-merges 2000 \
+    --min-frequency 2 \
+    --num-realizations 100 \
+    --aggregation-mode avg \
     --runs 5 \
     --seed 42 \
     --paper-amp off \
@@ -164,6 +188,9 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --bpe-backend cpp \
     --paper-cache-root cache/graph_tokenizer \
     --num-merges 2000 \
+    --min-frequency 2 \
+    --num-realizations 100 \
+    --aggregation-mode avg \
     --runs 5 \
     --seed 42 \
     --paper-amp off \
@@ -196,6 +223,9 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --bpe-backend cpp \
     --paper-cache-root cache/graph_tokenizer \
     --num-merges 2000 \
+    --min-frequency 2 \
+    --num-realizations 100 \
+    --aggregation-mode avg \
     --runs 5 \
     --seed 42 \
     --paper-amp off \
@@ -228,6 +258,9 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --bpe-backend cpp \
     --paper-cache-root cache/graph_tokenizer \
     --num-merges 2000 \
+    --min-frequency 2 \
+    --num-realizations 100 \
+    --aggregation-mode avg \
     --runs 5 \
     --seed 42 \
     --paper-amp off \
@@ -260,6 +293,9 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
     --bpe-backend cpp \
     --paper-cache-root cache/graph_tokenizer \
     --num-merges 2000 \
+    --min-frequency 2 \
+    --num-realizations 100 \
+    --aggregation-mode avg \
     --runs 5 \
     --seed 42 \
     --paper-amp off \
