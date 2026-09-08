@@ -5,7 +5,6 @@ import pytest
 import tensorlayerx as tlx
 
 torch = pytest.importorskip("torch")
-safetensors_torch = pytest.importorskip("safetensors.torch")
 
 from gammagl.models.graph_bert import GraphBERT
 from gammagl.models.graph_gte import GraphGTE, apply_rotary_pos_emb
@@ -128,6 +127,7 @@ def _synthetic_checkpoint(model):
 
 
 def test_converter_loads_synthetic_checkpoint_with_full_coverage(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
     source = _tiny_model(GraphGTE)
     tensors = _synthetic_checkpoint(source)
     checkpoint = tmp_path / "tiny.safetensors"
@@ -145,6 +145,7 @@ def test_converter_loads_synthetic_checkpoint_with_full_coverage(tmp_path):
 
 
 def test_converter_rejects_synthetic_shape_mismatch(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
     model = _tiny_model(GraphGTE)
     tensors = _synthetic_checkpoint(model)
     tensors["new.encoder.layer.0.attention.qkv_proj.weight"] = torch.zeros((1, 1))
