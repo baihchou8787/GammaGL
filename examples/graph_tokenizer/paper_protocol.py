@@ -9,6 +9,7 @@ import math
 import os
 import pickle
 import random
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
@@ -978,6 +979,14 @@ def _mask_for_mlm(torch, input_ids, attention_mask, tokenizer, mask_prob: float)
         device=labels.device)
     probabilities.masked_fill_(special, 0.0)
     selected = torch.bernoulli(probabilities).bool()
+    if not torch.any(selected):
+        candidates = (~special).reshape(-1).nonzero(
+            as_tuple=False).reshape(-1)
+        if candidates.numel() == 0:
+            raise ValueError("MLM batch contains no eligible tokens.")
+        chosen = candidates[torch.randint(
+            candidates.numel(), (1,), device=labels.device)]
+        selected.reshape(-1)[chosen] = True
     labels[~selected] = -100
     replaced = torch.bernoulli(torch.full(
         labels.shape, 0.8, device=labels.device)).bool() & selected
@@ -1053,6 +1062,40 @@ def _cuda_memory_query_device(torch, device):
     if device.type == "cuda" and device.index is None:
         return torch.cuda.current_device()
     return device
+
+
+def _visible_cuda_device(torch, device):
+    logical_index = (
+        torch.cuda.current_device()
+        if device.index is None else int(device.index))
+    visible_devices = [value.strip() for value in os.environ.get(
+        "CUDA_VISIBLE_DEVICES", "").split(",") if value.strip()]
+    if logical_index < len(visible_devices):
+        return visible_devices[logical_index]
+    return str(logical_index)
+
+
+def _wait_for_gpu_idle(torch, device, poll_seconds: int = 60) -> None:
+    """Wait until the physical CUDA device has no active compute process."""
+    if device.type != "cuda":
+        return
+    visible_device = _visible_cuda_device(torch, device)
+    while True:
+        result = subprocess.run(
+            ["nvidia-smi", "-i", visible_device,
+             "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True)
+        active_pids = [line.strip() for line in result.stdout.splitlines()
+                       if line.strip().isdigit()]
+        if not active_pids:
+            return
+        print(json.dumps({
+            "event": "paper_wait_for_gpu_idle",
+            "device": visible_device,
+            "active_pids": active_pids,
+            "poll_seconds": int(poll_seconds),
+        }), flush=True)
+        time.sleep(int(poll_seconds))
 
 
 def _new_grad_scaler(torch, amp_dtype: str):
@@ -1600,6 +1643,8 @@ def run_paper_experiment(args, spec, splits, fit_tokenizer):
     tokenizer.validate_model_vocab(model_vocab_size)
     pooling = getattr(args, "pooling", "mean")
     device = torch.device(getattr(args, "device", "cuda"))
+    if bool(getattr(args, "wait_for_gpu_idle", False)):
+        _wait_for_gpu_idle(torch, device)
     precision = _resolve_precision_options(torch, device, preset)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = precision["allow_tf32"]

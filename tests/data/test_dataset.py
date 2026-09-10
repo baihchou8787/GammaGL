@@ -5,7 +5,9 @@
 import os
 
 import pytest
+import tensorlayerx as tlx
 
+from gammagl.data import Graph
 from gammagl.datasets.ppi import PPI
 from gammagl.data.dataset import Dataset
 
@@ -25,18 +27,19 @@ def test_dataset():
     assert len(dataset2) == 20
 
 
-def test_torch_dataset_loader_restores_graph_objects(monkeypatch):
-    torch = __import__('torch')
-    observed = {}
+def test_torch_dataset_loader_restores_saved_graph(tmp_path):
+    import torch
 
-    def fake_load(path, **kwargs):
-        observed['path'] = path
-        observed.update(kwargs)
-        return ('graph', None)
-
-    monkeypatch.setattr(torch, 'load', fake_load)
+    path = tmp_path / 'graph.pt'
+    graph = Graph(
+        x=tlx.convert_to_tensor([[1.0], [2.0]]),
+        edge_index=tlx.convert_to_tensor([[0], [1]]),
+    )
+    torch.save((graph, None), path)
     dataset = object.__new__(Dataset)
 
-    assert dataset.load_data('trusted_graphs.pt') == ('graph', None)
-    assert observed['path'] == 'trusted_graphs.pt'
-    assert observed['weights_only'] is False
+    restored, slices = dataset.load_data(path)
+
+    assert isinstance(restored, Graph)
+    assert slices is None
+    assert tlx.convert_to_numpy(restored.x).tolist() == [[1.0], [2.0]]

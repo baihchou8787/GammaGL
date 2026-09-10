@@ -1648,6 +1648,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="cuda", help="Torch device used by --protocol paper.")
     parser.add_argument(
+        "--wait-for-gpu-idle", action="store_true",
+        help="Wait for the selected CUDA device to have no compute process before paper training.")
+    parser.add_argument(
         "--allow-random-gte-init", action="store_true",
         help=("Use randomly initialized GraphGTE. This disables paper "
               "reproduction status and is never the default."),
