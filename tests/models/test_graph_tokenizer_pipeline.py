@@ -151,6 +151,61 @@ def test_encode_splits_allows_sequence_at_max_length(trainer):
     assert encoded["train"][0]["input_ids"] == [3, 8, 9, 10, 11, 12, 13, 4]
 
 
+@pytest.mark.parametrize("dataset,length", (
+    ("qm9", 768),
+    ("molhiv", 826),
+    ("peptides-struct", 1587),
+    ("qm9", 8096),
+))
+def test_bert_formal_presets_accept_sequences_up_to_8096(trainer, dataset, length):
+    args = trainer.apply_preset(trainer.build_parser().parse_args([
+        "--dataset", dataset, "--encoder", "bert",
+    ]))
+    tokenizer = FixedLengthTokenizer([3] + list(range(8, 8 + length - 2)) + [4])
+    label_width = trainer.resolve_dataset(dataset).label_width
+    graph = SimpleNamespace(y=[0.0] * label_width)
+
+    encoded = trainer.encode_splits(tokenizer, {"train": [graph]}, args)
+
+    assert args.max_length == 8096
+    assert len(encoded["train"][0]["input_ids"]) == length
+
+
+def test_bert_formal_preset_rejects_sequence_longer_than_8096(trainer):
+    args = trainer.apply_preset(trainer.build_parser().parse_args([
+        "--dataset", "molhiv", "--encoder", "bert",
+    ]))
+    tokenizer = FixedLengthTokenizer([3] + list(range(8, 8 + 8097 - 2)) + [4])
+    graph = SimpleNamespace(y=[0.0])
+
+    with pytest.raises(ValueError, match="max_length=8096"):
+        trainer.encode_splits(tokenizer, {"train": [graph]}, args)
+
+
+def test_preset_rejects_a_sequence_limit_above_positional_capacity(trainer):
+    args = trainer.build_parser().parse_args([
+        "--dataset", "qm9", "--encoder", "bert", "--max-length", "8097",
+    ])
+
+    with pytest.raises(ValueError, match="max_length must not exceed max_position_embeddings"):
+        trainer.apply_preset(args)
+
+
+def test_trainer_collate_pads_to_the_longest_sequence_in_its_batch(trainer):
+    records = [
+        {"input_ids": list(range(826)), "labels": [0.0], "graph_id": 0},
+        {"input_ids": list(range(7)), "labels": [1.0], "graph_id": 1},
+    ]
+    loader = trainer.make_loader(
+        torch, records, batch_size=2, pad_token_id=0, shuffle=False,
+        choose_variant=False)
+
+    input_ids, attention, _, _ = next(iter(loader))
+
+    assert input_ids.shape == (2, 826)
+    assert attention.shape == (2, 826)
+
+
 def _run_result(seed, run_index, metric):
     return {
         "dataset": "qm9",

@@ -36,7 +36,7 @@ preset 值。长度超过 `max_length` 的序列化图会被拒绝而非截断�
 `PAPER_CONFIGS` 是基于固定的
 [GraphTokenizer 官方源码 revision
 `98343a6b025a48fbb6859cd812a12b81ec3ac3cc`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/tree/98343a6b025a48fbb6859cd812a12b81ec3ac3cc)
-整理得到的 GammaGL 训练 preset。它们保留该 GammaGL 入口所需的核心模型和训练设置，但并非对
+整理并适配到 streamlined GammaGL 训练入口的 preset。它们保留当前实现所需的核心模型和训练设置，但并非对
 原仓库默认配置、调优配置或 benchmark 编排进行逐字节、逐字段复刻。因此，下表中的任一行均不应
 被理解为其每个字段都从同一个上游配置文件原样继承。
 
@@ -48,11 +48,11 @@ merge、最小频率 2）、100 次序列化、0.1 的权重衰减、0.12 / 0.02
 
 | 实验 | Batch | MLM / 微调 LR | MLM / 微调 epoch | 最终最大长度 | BPE / 词表 | 序列化次数 | 微调耐心值 | 权重衰减 | 种子 | 架构 | Checkpoint revision |
 | --- | ---: | --- | ---: | ---: | --- | ---: | ---: | ---: | --- | --- | --- |
-| QM9 + BERT | 32 | 1e-4 / 1e-5 | 200 / 200 | 768 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
+| QM9 + BERT | 32 | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
 | QM9 + GTE | 32 | 5e-5 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
-| MolHIV + BERT | 32 | 1e-4 / 5e-5 | 200 / 200 | 768 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
+| MolHIV + BERT | 32 | 1e-4 / 5e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
 | MolHIV + GTE | 32 | 5e-5 / 5e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
-| Peptides-struct + BERT | 16 | 1e-4 / 1e-5 | 200 / 200 | 768 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
+| Peptides-struct + BERT | 16 | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
 | Peptides-struct + GTE | 16 | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
 
 ### 序列长度与位置容量的来源
@@ -60,14 +60,14 @@ merge、最小频率 2）、100 次序列化、0.1 的权重衰减、0.12 / 0.02
 `max_length` 是最终 GraphTokenizer 输入的最大长度，包含 tokenization 添加的 special token。
 它与 Transformer 的位置容量 `max_position_embeddings` 是两个不同的设置。
 
-对于 BERT，表中的 `max_length=768` 有直接的上游来源：固定 revision 的
-[`src/models/bert/data.py`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/blob/98343a6b025a48fbb6859cd812a12b81ec3ac3cc/src/models/bert/data.py#L76)
-在 `compute_effective_max_length` 中将 BERT 的有效上限设为 768。这是运行时覆盖：同一
-revision 的
+对于 BERT，正式 preset 的 `max_length=8096` 和
+`max_position_embeddings=8096` 均来自固定 revision 的
 [`config/default_config.yml`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/blob/98343a6b025a48fbb6859cd812a12b81ec3ac3cc/config/default_config.yml#L77-L83)
-为 BERT 配置列出 `max_seq_length=8096` 和 `max_position_embeddings=8096`。GammaGL 保留
-上游有效 BERT 上限（768）及独立的 BERT 位置容量（8096）。序列化图长度超过 `max_length`
-时会抛出 `ValueError`；绝不会静默截断图序列。
+中 BERT 的 `max_seq_length=8096` 与 `max_position_embeddings=8096`。上游
+[`src/models/bert/data.py`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/blob/98343a6b025a48fbb6859cd812a12b81ec3ac3cc/src/models/bert/data.py#L76)
+还含有将 BERT 运行时上限覆盖为 768 的运行时路径；GammaGL 不采用该路径，因为它与当前“完整图
+序列不得截断”的严格协议冲突。GammaGL 对长度超过 `max_length` 的序列化图抛出 `ValueError`，
+绝不会静默截断；trainer 的 collate 仅 pad 到当前 batch 中最长的序列，而不会固定 pad 到 8096。
 
 对于 GTE，GammaGL 使用 `max_length=8096` 和 `max_position_embeddings=8192`。后者是固定
 源码随附 GTE 的位置容量：
@@ -78,8 +78,8 @@ revision 的
 
 - **Warm-up 与梯度裁剪：** GammaGL 保留源码默认的 warm-up 比例（0.12 / 0.025）和分阶段
   梯度裁剪（2.0 / 0.5），并由本 trainer 的按 step warm-up/cosine scheduler 实现。
-- **长度处理：** BERT 的有效 768 上限来源如上；`max_position_embeddings` 仍是独立的模型
-  容量。GammaGL 对超长序列化图直接失败，而不静默截断。
+- **长度处理：** BERT 的最终输入上限与 `max_position_embeddings` 均为 8096，二者仍是
+  语义不同的设置。GammaGL 对超长序列化图直接失败，而不静默截断，并且按 batch 动态 padding。
 - **MLM 与早停：** GammaGL 在完整下游训练集上按配置的预训练 epoch 进行 MLM，只在微调阶段
   保留验证选择和早停；不保留上游的 MLM 验证／早停路径。
 - **Benchmark 编排：** 上游仓库有独立的数据准备、预训练、微调、批量启动和聚合程序。GammaGL

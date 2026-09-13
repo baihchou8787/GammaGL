@@ -49,7 +49,7 @@ _BASE_CONFIG = {
     "pretrain_learning_rate": 1e-4,
     "pretrain_epochs": 200,
     "finetune_epochs": 200,
-    "max_length": 768,
+    "max_length": 8096,
     "max_position_embeddings": 8096,
     "bpe_merges": 2000,
     "bpe_min_frequency": 2,
@@ -756,6 +756,9 @@ def apply_preset(args, config=None):
     for name, value in config.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
+    if args.max_length > args.max_position_embeddings:
+        raise ValueError(
+            "max_length must not exceed max_position_embeddings.")
     return args
 
 
