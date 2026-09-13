@@ -15,13 +15,16 @@ train-only BPE / train-only label normalization
 ```
 
 The final summary reports the five final-test metrics as `mean ± std`
-(population standard deviation, `ddof=0`).
+(sample standard deviation, `ddof=1`) to match the GraphTokenizer repeated-run
+statistical convention.
 Five runs do not mean five epochs: every run retains the preset's
 `pretrain_epochs`, `finetune_epochs`, and early-stopping settings (for example,
 200 pretraining and 200 finetuning epochs in the default presets).
 
 The test split is evaluated only after the best finetune checkpoint is
 restored. CLI values override every `PAPER_CONFIGS` preset value.
+Serialized graph sequences longer than `max_length` are rejected rather than
+truncated because truncation would discard graph structure.
 
 ## Supported graph scope
 

@@ -698,12 +698,12 @@ def aggregate_run_results(results):
         raise ValueError("Cannot aggregate zero GraphTokenizer runs")
     metrics = [result["metric"] for result in results]
     mean = statistics.mean(metrics)
-    std = statistics.pstdev(metrics)
+    std = statistics.stdev(metrics) if len(metrics) > 1 else 0.0
     first = results[0]
     return {"dataset": first["dataset"], "encoder": first["encoder"],
             "seeds": [result["seed"] for result in results], "num_runs": len(results),
             "metric_name": first["metric_name"], "run_metrics": metrics,
-            "mean": mean, "std": std, "std_ddof": 0,
+            "mean": mean, "std": std, "std_ddof": 1,
             "display": f"{mean} ± {std}", "complete": True}
 
 

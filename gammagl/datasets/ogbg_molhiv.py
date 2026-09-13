@@ -4,8 +4,11 @@ from ._molecular_benchmark import PreprocessedMolecularBenchmark
 class OGBGMolHIV(PreprocessedMolecularBenchmark):
     r"""The OGBG-molhiv molecular property prediction benchmark.
 
-    The GraphTokenizer paper bundle is downloaded and cached automatically
-    when the raw files are missing.
+    The GraphTokenizer paper data must be explicitly prepared before
+    constructing this dataset. It is materialized from the shared paper
+    release bundle; dataset construction does not download that bundle
+    implicitly. The GraphTokenizer example training entrypoint provides the
+    explicit preparation step.
     """
 
     name = 'ogbg-molhiv'

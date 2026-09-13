@@ -203,8 +203,8 @@ def test_main_orchestrates_five_runs_and_isolates_summaries(trainer, monkeypatch
                 f"run_{run_index + 1:02d}_seed_{seed}" / "summary.json").is_file()
 
 
-def test_aggregate_run_results_reports_population_standard_deviation(trainer):
-    metrics = [0.10, 0.11, 0.09, 0.12, 0.08]
+def test_aggregate_run_results_reports_sample_standard_deviation(trainer):
+    metrics = [1.0, 2.0, 3.0, 4.0, 5.0]
     summary = trainer.aggregate_run_results([
         _run_result(42, 0, metrics[0]), _run_result(43, 1, metrics[1]),
         _run_result(44, 2, metrics[2]), _run_result(45, 3, metrics[3]),
@@ -212,11 +212,19 @@ def test_aggregate_run_results_reports_population_standard_deviation(trainer):
     ])
 
     assert summary["run_metrics"] == metrics
-    assert summary["mean"] == pytest.approx(0.10)
-    assert summary["std"] == pytest.approx(math.sqrt(0.0002))
-    assert summary["std_ddof"] == 0
+    assert summary["mean"] == pytest.approx(3.0)
+    assert summary["std"] == pytest.approx(math.sqrt(2.5))
+    assert summary["std_ddof"] == 1
     assert summary["display"] == f"{summary['mean']} ± {summary['std']}"
     assert summary["complete"] is True
+
+
+def test_aggregate_run_results_uses_zero_std_for_one_metric(trainer):
+    summary = trainer.aggregate_run_results([_run_result(42, 0, 1.0)])
+
+    assert summary["mean"] == 1.0
+    assert summary["std"] == 0.0
+    assert summary["std_ddof"] == 1
 
 
 def test_main_does_not_write_complete_summary_when_a_run_fails(trainer, monkeypatch, tmp_path):
