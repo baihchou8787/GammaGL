@@ -1,4 +1,4 @@
-"""Single-run GraphTokenizer training entrypoint.
+"""GraphTokenizer training entrypoint.
 
 The trainer deliberately owns only the train/validation/test pipeline.  It
 uses GammaGL's serializers, BPE implementation, tokenizer, datasets, and
@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ DATASETS = (
     DatasetSpec("peptides-struct", ("peptides-struct", "peptides_struct", "p-struct"),
                 "multi_target_regression", 11),
 )
+
+DEFAULT_SEEDS = (42, 43, 44, 45, 46)
 
 
 # One small source of defaults.  CLI values override every item below.
@@ -113,6 +116,10 @@ def set_seed(torch, seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def emit_event(event: str, **fields: Any) -> None:
+    print(json.dumps({"event": event, **fields}, allow_nan=True), flush=True)
+
+
 def to_list(value):
     for method in ("detach", "cpu"):
         if hasattr(value, method):
@@ -182,12 +189,45 @@ def load_dataset_splits(data_root: str, spec: DatasetSpec) -> Dict[str, List[Gra
     from gammagl import datasets
 
     classes = {"qm9": "QM9", "molhiv": "OGBGMolHIV", "peptides-struct": "PeptidesStruct"}
-    dataset = getattr(datasets, classes[spec.name])(root=str(data_root))
+    try:
+        dataset = getattr(datasets, classes[spec.name])(root=str(data_root))
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            "GraphTokenizer dataset is not prepared. Run:\n\n"
+            "python examples/graph_tokenizer/graph_tokenizer_trainer.py "
+            f"--prepare-data --data-root {data_root}\n\n"
+            "before starting training.") from error
     indices = {name: [int(item) for item in to_list(values)]
                for name, values in dataset.get_idx_split().items()}
     validate_splits(len(dataset), indices)
     graphs = [graph_from_gammagl(dataset[index], spec) for index in range(len(dataset))]
     return {name: [graphs[index] for index in indices[name]] for name in indices}
+
+
+def prepare_data(data_root: str) -> None:
+    """Materialize all GraphTokenizer datasets from the shared release bundle."""
+    ensure_repo_on_path()
+    from gammagl.datasets._graph_tokenizer_download import materialize_paper_dataset
+
+    root = Path(data_root)
+    datasets = (
+        ("QM9", "qm9", ("qm9",)),
+        ("OGBG-MolHIV", "ogbg-molhiv", ("molhiv", "ogbg-molhiv", "ogbg_molhiv")),
+        ("Peptides-struct", "peptides-struct", ("peptides-struct", "peptides_struct", "p-struct")),
+    )
+    print("GraphTokenizer data preparation")
+    print(f"Cache: {(root / '.graph_tokenizer_release').resolve()}")
+    for label, name, aliases in datasets:
+        materialize_paper_dataset(
+            dataset_name=name,
+            aliases=aliases,
+            raw_dir=root / name / "raw",
+            cache_root=root,
+            allow_download=True,
+        )
+        print(f"{label}: READY")
+    print("Checksum: PASS")
+    print(f"Data root: {root.resolve()}")
 
 
 def synthetic_splits(spec: DatasetSpec) -> Dict[str, List[GraphRecord]]:
@@ -213,12 +253,17 @@ def make_tokenizer(args, train_graphs: Sequence[GraphRecord]):
     ensure_repo_on_path()
     from gammagl.transforms.graph_bpe import GraphBPE
     from gammagl.transforms.graph_serializer import FrequencyGuidedEulerianSerializer
-    from gammagl.transforms.graph_tokenizer import GraphTokenizer
+    from gammagl.transforms.graph_tokenizer import GraphTokenizer, GraphTokenizerSpecialTokens
+
+    special_tokens = GraphTokenizerSpecialTokens()
+    if getattr(args, "encoder", "bert") == "gte":
+        special_tokens = GraphTokenizerSpecialTokens(pad_token_id=1, unk_token_id=0)
 
     tokenizer = GraphTokenizer(
         serializer=FrequencyGuidedEulerianSerializer(),
         bpe=GraphBPE(num_merges=args.bpe_merges, min_frequency=args.bpe_min_frequency,
                      backend=args.bpe_backend),
+        special_tokens=special_tokens,
     )
     # The only tokenizer fit in this program receives the downstream train split.
     tokenizer.fit(train_graphs, graph_ids=list(range(len(train_graphs))),
@@ -226,24 +271,31 @@ def make_tokenizer(args, train_graphs: Sequence[GraphRecord]):
     return tokenizer
 
 
-def truncate(sequence: Sequence[int], max_length: int, sep_token: int) -> List[int]:
-    if len(sequence) <= max_length:
-        return list(sequence)
-    if max_length < 2:
-        raise ValueError("max_length must be at least two tokens.")
-    return [*sequence[:max_length - 1], int(sep_token)]
-
-
 def encode_splits(tokenizer, splits, args) -> Dict[str, List[Dict[str, Any]]]:
+    dataset = resolve_dataset(args.dataset).name
     encoded = {}
     for split_name, graphs in splits.items():
         records = []
         for graph_id, graph in enumerate(graphs):
             for start in tokenizer.realization_start_nodes(graph, args.num_serializations):
                 result = tokenizer.encode_graph(graph, start_node=start)
+                try:
+                    tokenizer.validate_token_sequences(
+                        [result.input_ids], max_length=args.max_length)
+                except ValueError as error:
+                    if len(result.input_ids) > args.max_length:
+                        raise ValueError(
+                            "GraphTokenizer sequence exceeds max_length:\n"
+                            f"dataset={dataset}\n"
+                            f"split={split_name}\n"
+                            f"sample={graph_id}\n"
+                            f"length={len(result.input_ids)}\n"
+                            f"max_length={args.max_length}\n"
+                            "GraphTokenizer does not truncate serialized graphs because "
+                            "truncation would discard graph structure.") from error
+                    raise
                 records.append({
-                    "input_ids": truncate(result.input_ids, args.max_length,
-                                          tokenizer.special_tokens.sep_token_id),
+                    "input_ids": result.input_ids,
                     "labels": list(graph.y), "graph_id": graph_id,
                 })
         if not records:
@@ -464,6 +516,7 @@ def run_mlm(torch, model, train_loader, val_loader, tokenizer, args, device, che
                                      args.seed + epoch)
         val_loss = evaluate_mlm(torch, model, val_loader, tokenizer, args, device, args.seed)
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+        emit_event("epoch", phase="pretrain", epoch=epoch, train_loss=train_loss, val_loss=val_loss)
         if best is None or val_loss < best:
             best, stale = val_loss, 0
             save_checkpoint(torch, checkpoint, model, epoch, val_loss)
@@ -554,6 +607,8 @@ def run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, no
         validation = evaluate_downstream(torch, model, val_loader, spec, normalizer, device)
         score = validation["metric"]
         history.append({"epoch": epoch, "train_loss": train_loss, "validation": validation})
+        emit_event("epoch", phase="finetune", epoch=epoch, train_loss=train_loss,
+                   validation_metric=score)
         improved = best is None or (score > best if higher_is_better else score < best)
         if improved:
             best, stale = score, 0
@@ -569,22 +624,41 @@ def run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, no
             "history": history, "test": test}
 
 
-def apply_preset(args):
-    config = PAPER_CONFIGS[(resolve_dataset(args.dataset).name, args.encoder)]
+def apply_preset(args, config=None):
+    if config is None:
+        config = PAPER_CONFIGS[(resolve_dataset(args.dataset).name, args.encoder)]
     for name, value in config.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
     return args
 
 
-def run_training(args):
-    args = apply_preset(args)
+def metric_name_for_dataset(spec):
+    if spec.name == "molhiv":
+        return "ROC-AUC"
+    if spec.name == "peptides-struct":
+        return "Average MAE"
+    return "MAE"
+
+
+def run_output_directory(args, spec, run_index, seed):
+    return (Path(args.output_dir) / spec.name / args.encoder /
+            f"run_{run_index + 1:02d}_seed_{seed}")
+
+
+def run_single_experiment(args, config, seed, run_index=0):
+    args = apply_preset(argparse.Namespace(**vars(args)), config)
+    args.seed = int(seed)
     torch = ensure_torch_backend()
     set_seed(torch, args.seed)
     spec = resolve_dataset(args.dataset)
     splits = synthetic_splits(spec) if args.smoke else load_dataset_splits(args.data_root, spec)
+    emit_event("stage", stage="tokenizer_fit", status="started")
     tokenizer = make_tokenizer(args, splits["train"])
+    emit_event("stage", stage="tokenizer_fit", status="completed")
+    emit_event("stage", stage="encoding", status="started")
     encoded = encode_splits(tokenizer, splits, args)
+    emit_event("stage", stage="encoding", status="completed")
     normalizer, output_dim = normalize_labels(encoded, spec)
     tokenizer.validate_model_vocab(tokenizer.max_token_id + 1)
     device = torch.device(args.device)
@@ -602,12 +676,14 @@ def run_training(args):
                              shuffle=False, choose_variant=False)
     test_loader = make_loader(**loader_args, records=encoded["test"],
                               shuffle=False, choose_variant=False)
-    directory = Path(args.output_dir) / spec.name / args.encoder
+    directory = run_output_directory(args, spec, run_index, args.seed)
     mlm = run_mlm(torch, model, mlm_train_loader, mlm_val_loader, tokenizer, args, device,
                   directory / "best_mlm.pt")
     finetune = run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, normalizer,
                               args, device, directory / "best_finetune.pt")
     summary = {"dataset": spec.name, "encoder": args.encoder, "seed": args.seed,
+            "run_index": run_index, "metric_name": metric_name_for_dataset(spec),
+            "metric": finetune["test"]["metric"],
             "tokenizer_fit_split": "train", "normalization_fit_split": "train",
             "mlm": mlm, "finetune": finetune,
             "checkpoints": {"mlm": str(directory / "best_mlm.pt"),
@@ -617,8 +693,22 @@ def run_training(args):
     return summary
 
 
+def aggregate_run_results(results):
+    if not results:
+        raise ValueError("Cannot aggregate zero GraphTokenizer runs")
+    metrics = [result["metric"] for result in results]
+    mean = statistics.mean(metrics)
+    std = statistics.pstdev(metrics)
+    first = results[0]
+    return {"dataset": first["dataset"], "encoder": first["encoder"],
+            "seeds": [result["seed"] for result in results], "num_runs": len(results),
+            "metric_name": first["metric_name"], "run_metrics": metrics,
+            "mean": mean, "std": std, "std_ddof": 0,
+            "display": f"{mean} ± {std}", "complete": True}
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description="Train GraphTokenizer once with validation-selected checkpoints.")
+    parser = argparse.ArgumentParser(description="Train GraphTokenizer with validation-selected checkpoints.")
     parser.add_argument("--dataset", default="qm9")
     parser.add_argument("--encoder", "--model", dest="encoder", choices=("bert", "gte"), default="bert")
     parser.add_argument("--data-root", default="data")
@@ -642,8 +732,14 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--max-grad-norm", type=float)
     parser.add_argument("--pooling", choices=("mean", "cls"))
-    parser.add_argument("--seed", type=int, default=42)
+    seed_options = parser.add_mutually_exclusive_group()
+    seed_options.add_argument("--seed", type=int,
+                              help="Compatibility alias for one explicit seed.")
+    seed_options.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS),
+                              help="Independent training seeds (default: 42 43 44 45 46).")
     parser.add_argument("--gte-checkpoint-cache-dir")
+    parser.add_argument("--prepare-data", action="store_true",
+                        help="Download and materialize shared GraphTokenizer data, then exit.")
     parser.add_argument("--allow-random-gte-init", action="store_true",
                         help="Development only; this is not a paper reproduction run.")
     parser.add_argument("--hidden-size", type=int)
@@ -657,6 +753,11 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.seed is not None:
+        args.seeds = [args.seed]
+    if args.prepare_data:
+        prepare_data(args.data_root)
+        return None
     if args.smoke:
         smoke_overrides = {"batch_size": 2, "pretrain_epochs": 2, "finetune_epochs": 2,
                            "max_length": 32, "max_position_embeddings": 32,
@@ -667,8 +768,34 @@ def main(argv=None):
         for name, value in smoke_overrides.items():
             if getattr(args, name) is None:
                 setattr(args, name, value)
-    summary = run_training(args)
-    print(json.dumps(summary, indent=2, allow_nan=True))
+    spec = resolve_dataset(args.dataset)
+    config = PAPER_CONFIGS[(spec.name, args.encoder)]
+    results = []
+    summary_path = Path(args.output_dir) / spec.name / args.encoder / "summary.json"
+    try:
+        for run_index, seed in enumerate(args.seeds):
+            print(f"=== Run {run_index + 1}/{len(args.seeds)} | seed={seed} ===", flush=True)
+            result = run_single_experiment(args, config, seed, run_index=run_index)
+            results.append(result)
+            directory = run_output_directory(args, spec, run_index, seed)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "summary.json").write_text(
+                json.dumps(result, indent=2, allow_nan=True), encoding="utf-8")
+            print(f"=== Run {run_index + 1}/{len(args.seeds)} completed ===\n"
+                  f"{result['metric_name']}: {result['metric']}", flush=True)
+    except Exception:
+        partial = {"dataset": spec.name, "encoder": args.encoder,
+                   "seeds": list(args.seeds), "num_runs": len(args.seeds),
+                   "metric_name": metric_name_for_dataset(spec),
+                   "run_metrics": [result["metric"] for result in results],
+                   "complete": False}
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(partial, indent=2, allow_nan=True), encoding="utf-8")
+        raise
+    summary = aggregate_run_results(results)
+    serialized = json.dumps(summary, indent=2, allow_nan=True)
+    summary_path.write_text(serialized, encoding="utf-8")
+    print(serialized, flush=True)
     return summary
 
 

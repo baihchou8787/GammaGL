@@ -26,6 +26,7 @@ jobs:
           pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
           pip install pybind11 ninja
+          python -m pip install "safetensors>=0.4"
 
       - name: Install package
         run: |

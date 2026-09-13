@@ -4,8 +4,8 @@ from ._molecular_benchmark import PreprocessedMolecularBenchmark
 class PeptidesStruct(PreprocessedMolecularBenchmark):
     r"""The Peptides-struct molecular graph regression benchmark.
 
-    Data must be prepared by the GraphTokenizer single-process preparation
-    command before construction; training never downloads the shared bundle.
+    The GraphTokenizer paper bundle is downloaded and cached automatically
+    when the raw files are missing.
     """
 
     name = 'peptides-struct'

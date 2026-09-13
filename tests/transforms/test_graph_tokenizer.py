@@ -184,3 +184,11 @@ def test_tokenizer_rejects_unfitted_and_overlong_sequences():
         tokenizer.encode_graph(graph)
     with pytest.raises(ValueError, match="exceeds max_length"):
         tokenizer.pad_token_sequences([[3, 8, 9, 4]], max_length=3)
+
+
+def test_tokenizer_validates_token_sequence_lengths_without_truncating():
+    tokenizer = GraphTokenizer()
+
+    assert tokenizer.validate_token_sequences([[3, 8, 9, 10, 11, 12, 13, 4]], max_length=8) is None
+    with pytest.raises(ValueError, match="exceeds max_length"):
+        tokenizer.validate_token_sequences([[3, 8, 9, 10, 11, 12, 13, 14, 4]], max_length=8)

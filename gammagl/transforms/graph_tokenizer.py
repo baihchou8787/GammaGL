@@ -308,12 +308,15 @@ class GraphTokenizer(BaseTransform):
             seed=seed,
         )
 
-    def pad_token_sequences(self, token_sequences, max_length: int):
+    def validate_token_sequences(self, token_sequences, max_length: int) -> None:
         if max_length <= 0:
             raise ValueError("max_length must be positive.")
         if any(len(sequence) > max_length for sequence in token_sequences):
             raise ValueError(
                 "Token sequence exceeds max_length; truncation would discard graph structure.")
+
+    def pad_token_sequences(self, token_sequences, max_length: int):
+        self.validate_token_sequences(token_sequences, max_length=max_length)
         input_ids = [
             [int(token) for token in sequence]
             for sequence in token_sequences

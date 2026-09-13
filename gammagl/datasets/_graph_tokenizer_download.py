@@ -73,10 +73,6 @@ def _bundle_lock(cache_dir: Path):
 def _resolve_bundle_source(cache_root: Path, allow_download: bool = False) -> Path:
     configured = os.environ.get(DATA_BUNDLE_ENV)
     if configured:
-        if not allow_download:
-            raise FileNotFoundError(
-                "GraphTokenizer paper data must be prepared by the single "
-                "data-preparation process before starting training workers.")
         source = Path(configured).expanduser().resolve()
         if not source.exists():
             raise FileNotFoundError(

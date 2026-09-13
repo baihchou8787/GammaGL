@@ -109,6 +109,7 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
                 aliases=self.aliases,
                 raw_dir=self.raw_dir,
                 cache_root=self.root,
+                allow_download=False,
             )
             return
 

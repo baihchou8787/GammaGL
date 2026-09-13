@@ -4,9 +4,9 @@ from ._molecular_benchmark import PreprocessedMolecularBenchmark
 class QM9(PreprocessedMolecularBenchmark):
     r"""The QM9 molecular property prediction benchmark.
 
-    This loader follows the GammaGL :class:`InMemoryDataset` workflow. On the
-    data is prepared by the GraphTokenizer single-process preparation command,
-    which caches the graph pickle and official split files under ``raw``.
+    This loader follows the GammaGL :class:`InMemoryDataset` workflow and
+    automatically downloads and caches the GraphTokenizer paper bundle when
+    its raw files are missing.
     """
 
     name = 'qm9'
