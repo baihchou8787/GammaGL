@@ -3,6 +3,7 @@ import io
 import json
 import math
 import pickle
+import random
 import sys
 import tarfile
 from pathlib import Path
@@ -50,7 +51,8 @@ class FixedLengthTokenizer:
         return [None]
 
     def encode_graph(self, _graph, start_node=None):
-        return SimpleNamespace(input_ids=list(self.input_ids))
+        return SimpleNamespace(input_ids=list(self.input_ids),
+                               serialized_token_ids=list(self.input_ids[1:-1]))
 
     def validate_token_sequences(self, token_sequences, max_length):
         return self.strict_tokenizer.validate_token_sequences(token_sequences, max_length)
@@ -164,6 +166,225 @@ def test_default_seeds_are_five_explicit_runs(trainer):
     assert trainer.build_parser().parse_args([]).seeds == [42, 43, 44, 45, 46]
 
 
+def test_paper_preset_uses_phase_specific_warmup_and_gradient_clipping(trainer):
+    args = trainer.apply_preset(trainer.build_parser().parse_args([
+        "--dataset", "molhiv", "--encoder", "gte",
+    ]))
+
+    assert args.pretrain_learning_rate == 5e-5
+    assert args.learning_rate == 5e-5
+    assert args.pretrain_epochs == 200
+    assert args.mask_probability == 0.09
+    assert args.pretrain_warmup_ratio == 0.12
+    assert args.finetune_warmup_ratio == 0.025
+    assert args.pretrain_max_grad_norm == 2.0
+    assert args.finetune_max_grad_norm == 0.5
+    assert (args.pretrain_swap_probability, args.pretrain_swap_ratio,
+            args.pretrain_swap_window) == (0.5, 0.10, 3)
+    assert (args.finetune_swap_probability, args.finetune_swap_ratio,
+            args.finetune_swap_window) == (0.4, 0.05, 3)
+    assert (args.finetune_mask_probability, args.finetune_mask_ratio) == (0.3, 0.05)
+    assert (args.finetune_noise_probability, args.finetune_noise_std) == (0.3, 0.01)
+
+
+def test_warmup_cosine_scheduler_warms_up_then_decays(trainer):
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+    scheduler = trainer.build_warmup_cosine_scheduler(
+        torch, optimizer, total_steps=100, warmup_ratio=0.12)
+    multiplier = scheduler.lr_lambdas[0]
+
+    assert multiplier(0) == pytest.approx(1 / 12)
+    assert multiplier(11) == pytest.approx(1.0)
+    assert multiplier(50) < 1.0
+    assert multiplier(100) == pytest.approx(0.01)
+
+
+def test_phase_training_uses_phase_specific_gradient_clipping(trainer, monkeypatch):
+    class CountingScheduler:
+        def __init__(self):
+            self.steps = 0
+
+        def step(self):
+            self.steps += 1
+
+    class TinyMLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, input_ids, attention, task):
+            return self.scale * torch.ones((len(input_ids), input_ids.shape[1], 7))
+
+    class TinySupervised(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, input_ids, attention, task):
+            return self.weight.expand(len(input_ids), 1)
+
+    clipped = []
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_",
+                        lambda _parameters, max_norm: clipped.append(max_norm))
+    tokenizer = SimpleNamespace(special_tokens=SimpleNamespace(
+        pad_token_id=0, cls_token_id=3, sep_token_id=4,
+        component_sep_token_id=5, mask_token_id=6))
+    loader = [(torch.tensor([[3, 2, 4]]), torch.ones((1, 3), dtype=torch.long),
+               torch.tensor([[1.0]]), torch.tensor([0]))]
+    mlm_model = TinyMLM()
+    mlm_scheduler = CountingScheduler()
+    trainer.train_mlm_epoch(
+        torch, mlm_model, loader, torch.optim.SGD(mlm_model.parameters(), lr=0.1),
+        mlm_scheduler, tokenizer, SimpleNamespace(mask_probability=1.0,
+                                                   pretrain_max_grad_norm=2.0),
+        torch.device("cpu"), seed=7)
+    supervised_model = TinySupervised()
+    supervised_scheduler = CountingScheduler()
+    trainer.train_downstream_epoch(
+        torch, supervised_model, loader,
+        torch.optim.SGD(supervised_model.parameters(), lr=0.1), supervised_scheduler,
+        trainer.resolve_dataset("qm9"), SimpleNamespace(
+            finetune_max_grad_norm=0.5, finetune_noise_probability=0.0,
+            finetune_noise_std=0.01),
+        torch.device("cpu"))
+
+    assert clipped == [2.0, 0.5]
+    assert mlm_scheduler.steps == 1
+    assert supervised_scheduler.steps == 1
+
+
+def test_set_seed_controls_python_numpy_torch_cuda_and_cudnn(trainer, monkeypatch):
+    calls = []
+    fake_numpy = SimpleNamespace(random=SimpleNamespace(
+        seed=lambda value: calls.append(("numpy", value))))
+    monkeypatch.setitem(sys.modules, "numpy", fake_numpy)
+    monkeypatch.setattr(trainer.random, "seed", lambda value: calls.append(("python", value)))
+
+    class FakeTorch:
+        class cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def manual_seed_all(value):
+                calls.append(("cuda", value))
+
+        class backends:
+            class cudnn:
+                deterministic = False
+                benchmark = True
+
+        @staticmethod
+        def manual_seed(value):
+            calls.append(("torch", value))
+
+    trainer.set_seed(FakeTorch, 17)
+
+    assert calls == [("python", 17), ("numpy", 17), ("torch", 17), ("cuda", 17)]
+    assert FakeTorch.backends.cudnn.deterministic is True
+    assert FakeTorch.backends.cudnn.benchmark is False
+
+
+def test_mlm_corruption_uses_80_10_10_and_excludes_special_tokens(trainer, monkeypatch):
+    tokenizer = SimpleNamespace(
+        special_tokens=SimpleNamespace(
+            pad_token_id=0, unk_token_id=1, mask_token_id=2, cls_token_id=3,
+            sep_token_id=4, node_start_token_id=5, node_end_token_id=6,
+            component_sep_token_id=7),
+        vocabulary={100: 8, 101: 9, 102: 10, 103: 11})
+    input_ids = torch.tensor([[0, 3, 8, 9, 10, 4, 2, 5, 6, 7]])
+    attention = torch.ones_like(input_ids)
+    draws = iter((
+        torch.zeros_like(input_ids, dtype=torch.float32),
+        torch.tensor([[0.0, 0.0, 0.1, 0.85, 0.95, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+    ))
+    monkeypatch.setattr(torch, "rand",
+                        lambda _shape, generator=None, device=None: next(draws).to(device))
+    monkeypatch.setattr(
+        torch, "randint",
+        lambda _high, shape, generator=None, device=None:
+        torch.zeros(shape, dtype=torch.long, device=device))
+
+    corrupted, labels = trainer.mask_for_mlm(
+        torch, input_ids, attention, tokenizer, probability=0.09,
+        generator=torch.Generator().manual_seed(7))
+
+    assert labels.tolist() == [[-100, -100, 8, 9, 10, -100, -100, -100, -100, -100]]
+    assert corrupted.tolist() == [[0, 3, 2, 8, 10, 4, 2, 5, 6, 7]]
+    assert corrupted[0, 3].item() not in set(vars(tokenizer.special_tokens).values())
+
+
+def test_random_swap_uses_local_window_and_preserves_special_positions(trainer):
+    tokens = [7, *range(8, 28)]
+    unchanged = trainer.random_swap_serialized_tokens(
+        tokens, {7}, probability=0.0, ratio=0.5, window=3, rng=random.Random(3))
+    swapped = trainer.random_swap_serialized_tokens(
+        tokens, {7}, probability=1.0, ratio=0.5, window=3, rng=random.Random(3))
+
+    assert unchanged == tokens
+    assert swapped != tokens
+    assert swapped[0] == 7
+    assert sorted(swapped) == sorted(tokens)
+
+
+def test_sequence_mask_only_changes_configured_non_special_positions(trainer):
+    tokens = [7, *range(8, 28)]
+    masked = trainer.sequence_mask_serialized_tokens(
+        tokens, {7}, mask_token_id=2, probability=1.0, ratio=0.1,
+        rng=random.Random(5))
+
+    assert masked[0] == 7
+    assert masked.count(2) == 2
+    assert all(masked[index] == tokens[index] for index in range(1, len(tokens))
+               if masked[index] != 2)
+
+
+def test_augmented_overlength_sequence_falls_back_without_truncation(trainer):
+    tokenizer = SimpleNamespace(
+        special_tokens=SimpleNamespace(mask_token_id=2),
+        encode_tokens=lambda tokens: [3, *tokens, 4])
+    original = [3, 8, 9, 4]
+    fallback = trainer.augment_record_input_ids(
+        tokenizer, original, list(range(8, 18)), {7},
+        {"swap_probability": 1.0, "swap_ratio": 0.5, "swap_window": 3},
+        max_length=4, rng=random.Random(2))
+
+    assert fallback == original
+
+
+def test_validation_and_test_augmentation_are_disabled(trainer):
+    tokens = [7, *range(8, 28)]
+
+    assert trainer.augment_serialized_tokens(tokens, {7}, None, random.Random(9)) == tokens
+
+
+def test_gaussian_noise_only_changes_training_pooled_representation(trainer):
+    class PooledModel:
+        def __call__(self, input_ids, attention, task):
+            if task == "pooled":
+                return torch.ones((len(input_ids), 2))
+            return torch.ones((len(input_ids), 2))
+
+        @staticmethod
+        def _task_logits(pooled):
+            return pooled
+
+    model = PooledModel()
+    input_ids = torch.tensor([[3, 8, 4]])
+    attention = torch.ones_like(input_ids)
+    noisy = trainer.supervised_logits(
+        torch, model, input_ids, attention, noise_probability=1.0, noise_std=0.01,
+        generator=torch.Generator().manual_seed(4))
+    clean = trainer.supervised_logits(
+        torch, model, input_ids, attention, noise_probability=0.0, noise_std=0.01,
+        generator=torch.Generator().manual_seed(4))
+
+    assert not torch.equal(noisy, clean)
+    assert torch.equal(clean, torch.ones((1, 2)))
+
+
 def test_main_runs_requested_single_experiment(trainer, monkeypatch, tmp_path):
     calls = []
 
@@ -247,7 +468,7 @@ def test_main_does_not_write_complete_summary_when_a_run_fails(trainer, monkeypa
     assert "display" not in partial
 
 
-def test_tiny_pipeline_runs_pretrain_restore_finetune_and_final_test(trainer, monkeypatch, tmp_path):
+def test_tiny_pipeline_runs_full_train_mlm_then_finetune_and_final_test(trainer, monkeypatch, tmp_path):
     splits = {
         "train": _qm9_graphs(trainer, 8),
         "val": _qm9_graphs(trainer, 4, 20),
@@ -263,10 +484,10 @@ def test_tiny_pipeline_runs_pretrain_restore_finetune_and_final_test(trainer, mo
 
     run_directory = tmp_path / "qm9" / "bert" / "run_01_seed_42"
     run_summary = json.loads((run_directory / "summary.json").read_text())
-    assert Path(run_summary["checkpoints"]["mlm"]).is_file()
     assert Path(run_summary["checkpoints"]["finetune"]).is_file()
-    assert all(math.isfinite(row["train_loss"]) and math.isfinite(row["val_loss"])
-               for row in run_summary["mlm"]["history"])
+    assert run_summary["mlm"]["epochs_completed"] == 2
+    assert all(math.isfinite(row["train_loss"]) for row in run_summary["mlm"]["history"])
+    assert all("val_loss" not in row for row in run_summary["mlm"]["history"])
     assert all(math.isfinite(row["train_loss"]) and math.isfinite(row["validation"]["metric"])
                for row in run_summary["finetune"]["history"])
     assert math.isfinite(run_summary["finetune"]["test"]["metric"])
@@ -431,11 +652,12 @@ def test_peptides_metric_inverse_transforms_each_target_before_averaging(trainer
     assert result["per_target_mae"] == pytest.approx([1.0] * 11)
 
 
-def test_mlm_early_stopping_restores_the_best_checkpoint(trainer, monkeypatch, tmp_path):
+def test_mlm_runs_configured_epochs_without_validation_or_checkpoint_restore(trainer, monkeypatch):
     model = torch.nn.Linear(1, 1, bias=False)
-    train_epochs, validation_losses = [], iter((0.5, 0.3, 0.4))
+    train_epochs = []
+    scheduler_arguments = []
     args = SimpleNamespace(pretrain_learning_rate=1e-3, weight_decay=0.0,
-                           pretrain_epochs=5, pretrain_early_stopping_patience=1, seed=7)
+                           pretrain_epochs=5, pretrain_warmup_ratio=0.12, seed=7)
 
     def train(*_args):
         train_epochs.append(len(train_epochs) + 1)
@@ -443,19 +665,54 @@ def test_mlm_early_stopping_restores_the_best_checkpoint(trainer, monkeypatch, t
         return 0.1
 
     monkeypatch.setattr(trainer, "train_mlm_epoch", train)
-    monkeypatch.setattr(trainer, "evaluate_mlm", lambda *_args: next(validation_losses))
-    result = trainer.run_mlm(torch, model, None, None, None, args, torch.device("cpu"), tmp_path / "mlm.pt")
+    monkeypatch.setattr(
+        trainer, "build_warmup_cosine_scheduler",
+        lambda _torch, _optimizer, total_steps, warmup_ratio:
+        scheduler_arguments.append((total_steps, warmup_ratio)) or object())
+    result = trainer.run_mlm(torch, model, [None], None, args, torch.device("cpu"))
 
-    assert result["best_epoch"] == 2
-    assert len(result["history"]) == 3
-    assert float(model.weight.detach()) == 2.0
+    assert train_epochs == [1, 2, 3, 4, 5]
+    assert result["epochs_completed"] == 5
+    assert result["final_loss"] == 0.1
+    assert all(set(row) == {"epoch", "train_loss"} for row in result["history"])
+    assert scheduler_arguments == [(5, 0.12)]
+
+
+def test_single_run_uses_every_downstream_training_graph_for_mlm(trainer, monkeypatch, tmp_path):
+    splits = {
+        "train": _qm9_graphs(trainer, 4),
+        "val": _qm9_graphs(trainer, 2, 20),
+        "test": _qm9_graphs(trainer, 2, 40),
+    }
+    observed = {}
+    monkeypatch.setattr(trainer, "synthetic_splits", lambda _spec: splits)
+
+    def run_mlm(_torch, _model, train_loader, _tokenizer, _args, _device):
+        observed["graph_ids"] = {group[0]["graph_id"] for group in train_loader.dataset}
+        return {"epochs_completed": 2, "final_loss": 0.1,
+                "history": [{"epoch": 1, "train_loss": 0.1},
+                            {"epoch": 2, "train_loss": 0.1}]}
+
+    monkeypatch.setattr(trainer, "run_mlm", run_mlm)
+    monkeypatch.setattr(
+        trainer, "run_finetuning",
+        lambda *_args: {"best_epoch": 1, "best_validation_metric": 0.1,
+                        "history": [], "test": {"metric": 0.1}})
+
+    trainer.main([
+        "--smoke", "--dataset", "qm9", "--encoder", "bert", "--device", "cpu",
+        "--seeds", "42", "--output-dir", str(tmp_path),
+    ])
+
+    assert observed["graph_ids"] == {0, 1, 2, 3}
 
 
 def test_finetune_early_stopping_restores_best_before_test(trainer, monkeypatch, tmp_path):
     model = torch.nn.Linear(1, 1, bias=False)
     epochs, validation_metrics, validation_calls, test_weights = [], iter((2.0, 1.0, 3.0)), [], []
+    scheduler_arguments = []
     args = SimpleNamespace(learning_rate=1e-3, weight_decay=0.0, finetune_epochs=5,
-                           early_stopping_patience=1)
+                           finetune_warmup_ratio=0.025, early_stopping_patience=1, seed=7)
 
     def train(*_args):
         epochs.append(len(epochs) + 1)
@@ -471,11 +728,16 @@ def test_finetune_early_stopping_restores_best_before_test(trainer, monkeypatch,
 
     monkeypatch.setattr(trainer, "train_downstream_epoch", train)
     monkeypatch.setattr(trainer, "evaluate_downstream", evaluate)
+    monkeypatch.setattr(
+        trainer, "build_warmup_cosine_scheduler",
+        lambda _torch, _optimizer, total_steps, warmup_ratio:
+        scheduler_arguments.append((total_steps, warmup_ratio)) or object())
     result = trainer.run_finetuning(
-        torch, model, None, None, None, trainer.resolve_dataset("qm9"), None, args,
+        torch, model, [None], None, None, trainer.resolve_dataset("qm9"), None, args,
         torch.device("cpu"), tmp_path / "finetune.pt")
 
     assert result["best_epoch"] == 2
     assert len(result["history"]) == 3
     assert result["test"]["metric"] == 2.0
     assert test_weights == [2.0]
+    assert scheduler_arguments == [(5, 0.025)]

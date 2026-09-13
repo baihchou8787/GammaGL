@@ -40,7 +40,9 @@ DATASETS = (
 DEFAULT_SEEDS = (42, 43, 44, 45, 46)
 
 
-# One small source of defaults.  CLI values override every item below.
+# GammaGL presets derived from the pinned official GraphTokenizer implementation.
+# CLI values override every item below.  ``max_length`` is the final input
+# limit, distinct from the model's ``max_position_embeddings`` capacity.
 _BASE_CONFIG = {
     "batch_size": 32,
     "learning_rate": 1e-5,
@@ -53,11 +55,22 @@ _BASE_CONFIG = {
     "bpe_min_frequency": 2,
     "num_serializations": 100,
     "early_stopping_patience": 20,
-    "pretrain_early_stopping_patience": 20,
     "mask_probability": 0.09,
     "weight_decay": 0.1,
-    "max_grad_norm": 1.0,
-    "mlm_validation_fraction": 0.1,
+    "pretrain_warmup_ratio": 0.12,
+    "finetune_warmup_ratio": 0.025,
+    "pretrain_max_grad_norm": 2.0,
+    "finetune_max_grad_norm": 0.5,
+    "pretrain_swap_probability": 0.5,
+    "pretrain_swap_ratio": 0.10,
+    "pretrain_swap_window": 3,
+    "finetune_swap_probability": 0.4,
+    "finetune_swap_ratio": 0.05,
+    "finetune_swap_window": 3,
+    "finetune_mask_probability": 0.3,
+    "finetune_mask_ratio": 0.05,
+    "finetune_noise_probability": 0.3,
+    "finetune_noise_std": 0.01,
     "pooling": "mean",
 }
 PAPER_CONFIGS = {
@@ -111,9 +124,40 @@ def ensure_torch_backend():
 
 def set_seed(torch, seed: int) -> None:
     random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    cudnn = getattr(getattr(torch, "backends", None), "cudnn", None)
+    if cudnn is not None:
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+
+
+def build_warmup_cosine_scheduler(
+        torch, optimizer, total_steps: int, warmup_ratio: float, min_lr_ratio: float = 0.01):
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive.")
+    if not 0.0 <= warmup_ratio < 1.0:
+        raise ValueError("warmup_ratio must be in [0, 1).")
+    if not 0.0 < min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be in (0, 1].")
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    def multiplier(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / warmup_steps
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(step - warmup_steps) / decay_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
 def emit_event(event: str, **fields: Any) -> None:
@@ -296,6 +340,7 @@ def encode_splits(tokenizer, splits, args) -> Dict[str, List[Dict[str, Any]]]:
                     raise
                 records.append({
                     "input_ids": result.input_ids,
+                    "serialized_token_ids": result.serialized_token_ids,
                     "labels": list(graph.y), "graph_id": graph_id,
                 })
         if not records:
@@ -343,17 +388,93 @@ def group_records(records: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]
     return list(grouped.values())
 
 
-def make_loader(torch, records, batch_size, pad_token_id, shuffle, choose_variant):
+def random_swap_serialized_tokens(tokens, special_ids, probability, ratio, window, rng):
+    augmented = list(tokens)
+    if probability <= 0.0 or rng.random() >= float(probability):
+        return augmented
+    positions = [index for index, token in enumerate(augmented) if int(token) not in special_ids]
+    for _ in range(int(len(positions) * float(ratio))):
+        first = rng.choice(positions)
+        nearby = [index for index in positions
+                  if index != first and abs(index - first) <= int(window) // 2]
+        if nearby:
+            second = rng.choice(nearby)
+            augmented[first], augmented[second] = augmented[second], augmented[first]
+    return augmented
+
+
+def sequence_mask_serialized_tokens(tokens, special_ids, mask_token_id, probability, ratio, rng):
+    augmented = list(tokens)
+    if probability <= 0.0 or rng.random() >= float(probability):
+        return augmented
+    positions = [index for index, token in enumerate(augmented) if int(token) not in special_ids]
+    count = min(len(positions), max(1, int(len(positions) * float(ratio))))
+    for index in rng.sample(positions, count):
+        augmented[index] = int(mask_token_id)
+    return augmented
+
+
+def augment_serialized_tokens(tokens, special_ids, augmentation, rng):
+    if augmentation is None:
+        return list(tokens)
+    tokens = random_swap_serialized_tokens(
+        tokens, special_ids, augmentation["swap_probability"], augmentation["swap_ratio"],
+        augmentation["swap_window"], rng)
+    if "mask_probability" in augmentation:
+        tokens = sequence_mask_serialized_tokens(
+            tokens, special_ids, augmentation["mask_token_id"],
+            augmentation["mask_probability"], augmentation["mask_ratio"], rng)
+    return tokens
+
+
+def augment_record_input_ids(
+        tokenizer, original_input_ids, serialized_token_ids, special_ids, augmentation,
+        max_length, rng):
+    if augmentation is None:
+        return list(original_input_ids)
+    augmented = augment_serialized_tokens(serialized_token_ids, special_ids, augmentation, rng)
+    input_ids = tokenizer.encode_tokens(augmented)
+    return input_ids if len(input_ids) <= int(max_length) else list(original_input_ids)
+
+
+def augmentation_config(args, phase):
+    prefix = f"{phase}_swap"
+    config = {"swap_probability": getattr(args, f"{prefix}_probability"),
+              "swap_ratio": getattr(args, f"{prefix}_ratio"),
+              "swap_window": getattr(args, f"{prefix}_window")}
+    if phase == "finetune":
+        config.update({"mask_probability": args.finetune_mask_probability,
+                       "mask_ratio": args.finetune_mask_ratio,
+                       "mask_token_id": None})
+    return config
+
+
+def make_loader(
+        torch, records, batch_size, pad_token_id, shuffle, choose_variant, tokenizer=None,
+        augmentation=None, max_length=None, seed=0):
     data = group_records(records) if choose_variant else list(records)
+    rng = random.Random(int(seed))
 
     def collate(items):
         if choose_variant:
-            items = [random.choice(group) for group in items]
-        length = max(len(item["input_ids"]) for item in items)
+            items = [rng.choice(group) for group in items]
+        sequences = []
+        for item in items:
+            if augmentation is None:
+                sequences.append(item["input_ids"])
+                continue
+            if tokenizer is None or max_length is None:
+                raise ValueError("Training augmentation requires tokenizer and max_length.")
+            config = dict(augmentation)
+            config["mask_token_id"] = tokenizer.special_tokens.mask_token_id
+            sequences.append(augment_record_input_ids(
+                tokenizer, item["input_ids"], item["serialized_token_ids"],
+                mlm_special_token_ids(tokenizer), config, max_length, rng))
+        length = max(len(sequence) for sequence in sequences)
         input_ids = torch.full((len(items), length), int(pad_token_id), dtype=torch.long)
         attention = torch.zeros_like(input_ids)
-        for row, item in enumerate(items):
-            tokens = torch.as_tensor(item["input_ids"], dtype=torch.long)
+        for row, tokens in enumerate(sequences):
+            tokens = torch.as_tensor(tokens, dtype=torch.long)
             input_ids[row, :len(tokens)] = tokens
             attention[row, :len(tokens)] = 1
         return (input_ids, attention,
@@ -362,19 +483,6 @@ def make_loader(torch, records, batch_size, pad_token_id, shuffle, choose_varian
 
     return torch.utils.data.DataLoader(data, batch_size=max(1, int(batch_size)),
                                       shuffle=bool(shuffle), collate_fn=collate)
-
-
-def split_mlm_records(records, fraction: float, seed: int):
-    groups = group_records(records)
-    if len(groups) < 2:
-        raise ValueError("MLM validation needs at least two training graphs.")
-    order = list(range(len(groups)))
-    random.Random(seed).shuffle(order)
-    validation_count = min(len(groups) - 1, max(1, round(len(groups) * float(fraction))))
-    validation = {order[index] for index in range(validation_count)}
-    train = [record for index, group in enumerate(groups) for record in group if index not in validation]
-    val = [record for index, group in enumerate(groups) for record in group if index in validation]
-    return train, val
 
 
 def set_model_mode(model, training: bool) -> None:
@@ -423,30 +531,57 @@ def gte_initialization_summary(model, args):
     return manifest
 
 
+def mlm_special_token_ids(tokenizer) -> set[int]:
+    return {int(token_id) for token_id in vars(tokenizer.special_tokens).values()}
+
+
+def mlm_random_token_ids(tokenizer) -> List[int]:
+    special_ids = mlm_special_token_ids(tokenizer)
+    token_ids = sorted({int(token_id) for token_id in tokenizer.vocabulary.values()} - special_ids)
+    if not token_ids:
+        raise ValueError("MLM random replacement requires a non-special tokenizer vocabulary.")
+    return token_ids
+
+
 def mask_for_mlm(torch, input_ids, attention, tokenizer, probability, generator):
     labels = input_ids.clone()
     blocked = ~attention.bool()
-    for token in (tokenizer.special_tokens.pad_token_id, tokenizer.special_tokens.cls_token_id,
-                  tokenizer.special_tokens.sep_token_id, tokenizer.special_tokens.component_sep_token_id):
+    for token in mlm_special_token_ids(tokenizer):
         blocked |= input_ids.eq(int(token))
     selected = torch.rand(input_ids.shape, generator=generator, device=input_ids.device) < probability
     selected &= ~blocked
-    for row in range(len(input_ids)):
-        if not selected[row].any():
-            available = torch.where(~blocked[row])[0]
-            if len(available):
-                selected[row, available[0]] = True
     labels[~selected] = -100
     masked = input_ids.clone()
-    masked[selected] = int(tokenizer.special_tokens.mask_token_id)
+    corruption = torch.rand(input_ids.shape, generator=generator, device=input_ids.device)
+    mask_replaced = selected & (corruption < 0.8)
+    random_replaced = selected & (corruption >= 0.8) & (corruption < 0.9)
+    masked[mask_replaced] = int(tokenizer.special_tokens.mask_token_id)
+    if random_replaced.any():
+        candidates = torch.as_tensor(mlm_random_token_ids(tokenizer), dtype=torch.long,
+                                     device=input_ids.device)
+        random_indices = torch.randint(len(candidates), input_ids.shape, generator=generator,
+                                       device=input_ids.device)
+        masked[random_replaced] = candidates[random_indices[random_replaced]]
     return masked, labels
 
 
 def mlm_loss(torch, model, input_ids, attention, tokenizer, probability, generator):
     masked, labels = mask_for_mlm(torch, input_ids, attention, tokenizer, probability, generator)
     logits = model(masked, attention, task="mlm")
-    return torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1),
-                                             ignore_index=-100)
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100,
+        reduction="sum")
+    return loss / labels.ne(-100).sum().clamp(min=1)
+
+
+def supervised_logits(torch, model, input_ids, attention, noise_probability, noise_std, generator):
+    if noise_probability <= 0.0 or not callable(getattr(model, "_task_logits", None)):
+        return model(input_ids, attention, task="supervised")
+    pooled = model(input_ids, attention, task="pooled")
+    if torch.rand((), generator=generator, device=pooled.device) < float(noise_probability):
+        pooled = pooled + torch.randn(
+            pooled.shape, generator=generator, dtype=pooled.dtype, device=pooled.device) * float(noise_std)
+    return model._task_logits(pooled)
 
 
 def supervised_loss(torch, logits, labels, spec: DatasetSpec):
@@ -476,7 +611,7 @@ def restore_checkpoint(torch, path: Path, model, device):
     return state
 
 
-def train_mlm_epoch(torch, model, loader, optimizer, tokenizer, args, device, seed):
+def train_mlm_epoch(torch, model, loader, optimizer, scheduler, tokenizer, args, device, seed):
     set_model_mode(model, True)
     generator = torch.Generator(device=device).manual_seed(seed)
     total, count = 0.0, 0
@@ -486,46 +621,28 @@ def train_mlm_epoch(torch, model, loader, optimizer, tokenizer, args, device, se
         loss = mlm_loss(torch, model, input_ids, attention, tokenizer,
                         args.mask_probability, generator)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.pretrain_max_grad_norm)
         optimizer.step()
+        scheduler.step()
         total += float(loss.detach()) * len(input_ids)
         count += len(input_ids)
     return total / max(count, 1)
 
 
-def evaluate_mlm(torch, model, loader, tokenizer, args, device, seed):
-    set_model_mode(model, False)
-    generator = torch.Generator(device=device).manual_seed(seed)
-    total, count = 0.0, 0
-    with torch.no_grad():
-        for input_ids, attention, _, _ in loader:
-            input_ids, attention = input_ids.to(device), attention.to(device)
-            loss = mlm_loss(torch, model, input_ids, attention, tokenizer,
-                            args.mask_probability, generator)
-            total += float(loss) * len(input_ids)
-            count += len(input_ids)
-    return total / max(count, 1)
-
-
-def run_mlm(torch, model, train_loader, val_loader, tokenizer, args, device, checkpoint: Path):
+def run_mlm(torch, model, train_loader, tokenizer, args, device):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.pretrain_learning_rate,
                                   weight_decay=args.weight_decay)
-    best, stale, history = None, 0, []
+    scheduler = build_warmup_cosine_scheduler(
+        torch, optimizer, total_steps=len(train_loader) * args.pretrain_epochs,
+        warmup_ratio=args.pretrain_warmup_ratio)
+    history = []
     for epoch in range(1, args.pretrain_epochs + 1):
-        train_loss = train_mlm_epoch(torch, model, train_loader, optimizer, tokenizer, args, device,
-                                     args.seed + epoch)
-        val_loss = evaluate_mlm(torch, model, val_loader, tokenizer, args, device, args.seed)
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        emit_event("epoch", phase="pretrain", epoch=epoch, train_loss=train_loss, val_loss=val_loss)
-        if best is None or val_loss < best:
-            best, stale = val_loss, 0
-            save_checkpoint(torch, checkpoint, model, epoch, val_loss)
-        else:
-            stale += 1
-            if stale >= args.pretrain_early_stopping_patience:
-                break
-    state = restore_checkpoint(torch, checkpoint, model, device)
-    return {"best_epoch": state["epoch"], "best_val_loss": state["score"], "history": history}
+        train_loss = train_mlm_epoch(torch, model, train_loader, optimizer, scheduler, tokenizer,
+                                     args, device, args.seed + epoch)
+        history.append({"epoch": epoch, "train_loss": train_loss})
+        emit_event("epoch", phase="pretrain", epoch=epoch, train_loss=train_loss)
+    return {"epochs_completed": len(history), "final_loss": history[-1]["train_loss"],
+            "history": history}
 
 
 def roc_auc(labels: Sequence[float], scores: Sequence[float]) -> float:
@@ -583,16 +700,21 @@ def evaluate_downstream(torch, model, loader, spec, normalizer, device):
             "num_graphs": len(grouped), **detail}
 
 
-def train_downstream_epoch(torch, model, loader, optimizer, spec, args, device):
+def train_downstream_epoch(torch, model, loader, optimizer, scheduler, spec, args, device, seed=0):
     set_model_mode(model, True)
+    generator = torch.Generator(device=device).manual_seed(seed)
     total, count = 0.0, 0
     for input_ids, attention, labels, _ in loader:
         input_ids, attention, labels = input_ids.to(device), attention.to(device), labels.to(device)
         optimizer.zero_grad(set_to_none=True)
-        loss = supervised_loss(torch, model(input_ids, attention, task="supervised"), labels, spec)
+        loss = supervised_loss(
+            torch, supervised_logits(
+                torch, model, input_ids, attention, args.finetune_noise_probability,
+                args.finetune_noise_std, generator), labels, spec)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.finetune_max_grad_norm)
         optimizer.step()
+        scheduler.step()
         total += float(loss.detach()) * len(input_ids)
         count += len(input_ids)
     return total / max(count, 1)
@@ -600,10 +722,14 @@ def train_downstream_epoch(torch, model, loader, optimizer, spec, args, device):
 
 def run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, normalizer, args, device, checkpoint):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = build_warmup_cosine_scheduler(
+        torch, optimizer, total_steps=len(train_loader) * args.finetune_epochs,
+        warmup_ratio=args.finetune_warmup_ratio)
     best, stale, history = None, 0, []
     higher_is_better = spec.name == "molhiv"
     for epoch in range(1, args.finetune_epochs + 1):
-        train_loss = train_downstream_epoch(torch, model, train_loader, optimizer, spec, args, device)
+        train_loss = train_downstream_epoch(
+            torch, model, train_loader, optimizer, scheduler, spec, args, device, args.seed + epoch)
         validation = evaluate_downstream(torch, model, val_loader, spec, normalizer, device)
         score = validation["metric"]
         history.append({"epoch": epoch, "train_loss": train_loss, "validation": validation})
@@ -663,22 +789,22 @@ def run_single_experiment(args, config, seed, run_index=0):
     tokenizer.validate_model_vocab(tokenizer.max_token_id + 1)
     device = torch.device(args.device)
     model = make_model(args, tokenizer.max_token_id + 1, tokenizer.special_tokens.pad_token_id, output_dim).to(device)
-    mlm_train, mlm_val = split_mlm_records(encoded["train"], args.mlm_validation_fraction, args.seed)
     loader_args = {"torch": torch, "batch_size": args.batch_size,
                    "pad_token_id": tokenizer.special_tokens.pad_token_id}
-    mlm_train_loader = make_loader(**loader_args, records=mlm_train,
-                                   shuffle=True, choose_variant=True)
-    mlm_val_loader = make_loader(**loader_args, records=mlm_val,
-                                 shuffle=False, choose_variant=False)
-    train_loader = make_loader(**loader_args, records=encoded["train"],
-                               shuffle=True, choose_variant=True)
+    pretrain_loader = make_loader(
+        **loader_args, records=encoded["train"], shuffle=True, choose_variant=True,
+        tokenizer=tokenizer, augmentation=augmentation_config(args, "pretrain"),
+        max_length=args.max_length, seed=args.seed)
+    train_loader = make_loader(
+        **loader_args, records=encoded["train"], shuffle=True, choose_variant=True,
+        tokenizer=tokenizer, augmentation=augmentation_config(args, "finetune"),
+        max_length=args.max_length, seed=args.seed + 1)
     val_loader = make_loader(**loader_args, records=encoded["val"],
                              shuffle=False, choose_variant=False)
     test_loader = make_loader(**loader_args, records=encoded["test"],
                               shuffle=False, choose_variant=False)
     directory = run_output_directory(args, spec, run_index, args.seed)
-    mlm = run_mlm(torch, model, mlm_train_loader, mlm_val_loader, tokenizer, args, device,
-                  directory / "best_mlm.pt")
+    mlm = run_mlm(torch, model, pretrain_loader, tokenizer, args, device)
     finetune = run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, normalizer,
                               args, device, directory / "best_finetune.pt")
     summary = {"dataset": spec.name, "encoder": args.encoder, "seed": args.seed,
@@ -686,8 +812,7 @@ def run_single_experiment(args, config, seed, run_index=0):
             "metric": finetune["test"]["metric"],
             "tokenizer_fit_split": "train", "normalization_fit_split": "train",
             "mlm": mlm, "finetune": finetune,
-            "checkpoints": {"mlm": str(directory / "best_mlm.pt"),
-                            "finetune": str(directory / "best_finetune.pt")}}
+            "checkpoints": {"finetune": str(directory / "best_finetune.pt")}}
     if args.encoder == "gte":
         summary["gte_initialization"] = gte_initialization_summary(model, args)
     return summary
@@ -726,11 +851,22 @@ def build_parser():
     parser.add_argument("--bpe-backend", choices=("python", "auto", "cpp"), default="python")
     parser.add_argument("--num-serializations", "--num-realizations", dest="num_serializations", type=int)
     parser.add_argument("--early-stopping-patience", "--patience", dest="early_stopping_patience", type=int)
-    parser.add_argument("--pretrain-early-stopping-patience", type=int)
-    parser.add_argument("--mlm-validation-fraction", type=float)
     parser.add_argument("--mask-probability", "--mask-prob", dest="mask_probability", type=float)
     parser.add_argument("--weight-decay", type=float)
-    parser.add_argument("--max-grad-norm", type=float)
+    parser.add_argument("--pretrain-warmup-ratio", type=float)
+    parser.add_argument("--finetune-warmup-ratio", type=float)
+    parser.add_argument("--pretrain-max-grad-norm", type=float)
+    parser.add_argument("--finetune-max-grad-norm", type=float)
+    parser.add_argument("--pretrain-swap-probability", type=float)
+    parser.add_argument("--pretrain-swap-ratio", type=float)
+    parser.add_argument("--pretrain-swap-window", type=int)
+    parser.add_argument("--finetune-swap-probability", type=float)
+    parser.add_argument("--finetune-swap-ratio", type=float)
+    parser.add_argument("--finetune-swap-window", type=int)
+    parser.add_argument("--finetune-mask-probability", type=float)
+    parser.add_argument("--finetune-mask-ratio", type=float)
+    parser.add_argument("--finetune-noise-probability", type=float)
+    parser.add_argument("--finetune-noise-std", type=float)
     parser.add_argument("--pooling", choices=("mean", "cls"))
     seed_options = parser.add_mutually_exclusive_group()
     seed_options.add_argument("--seed", type=int,
@@ -762,7 +898,7 @@ def main(argv=None):
         smoke_overrides = {"batch_size": 2, "pretrain_epochs": 2, "finetune_epochs": 2,
                            "max_length": 32, "max_position_embeddings": 32,
                            "bpe_merges": 8, "num_serializations": 1,
-                           "early_stopping_patience": 1, "pretrain_early_stopping_patience": 1,
+                           "early_stopping_patience": 1,
                            "hidden_size": 16, "num_hidden_layers": 1,
                            "num_attention_heads": 4, "intermediate_size": 32}
         for name, value in smoke_overrides.items():

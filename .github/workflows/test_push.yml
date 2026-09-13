@@ -32,6 +32,10 @@ jobs:
         run: |
           GAMMAGL_WITH_CUDA=0 pip install -e ".[dev]" --no-build-isolation
 
+      - name: Verify GraphTokenizer paper extra installs
+        run: |
+          GAMMAGL_WITH_CUDA=0 pip install -e ".[graph-tokenizer-paper]" --no-build-isolation
+
       - name: Run checks
         run: |
           TL_BACKEND=torch python -m compileall -q gammagl tests examples
