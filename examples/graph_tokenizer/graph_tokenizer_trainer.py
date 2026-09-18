@@ -682,6 +682,12 @@ def optimizer_steps_per_epoch(loader, args) -> int:
     return math.ceil(len(loader) / gradient_accumulation_steps(args))
 
 
+def gradient_accumulation_window_size(batch_index: int, batch_count: int,
+                                      accumulation_steps: int) -> int:
+    window_start = (batch_index // accumulation_steps) * accumulation_steps
+    return min(accumulation_steps, batch_count - window_start)
+
+
 def train_mlm_epoch(torch, model, loader, optimizer, scheduler, tokenizer, args, device, seed):
     set_model_mode(model, True)
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -693,7 +699,8 @@ def train_mlm_epoch(torch, model, loader, optimizer, scheduler, tokenizer, args,
         input_ids, attention = input_ids.to(device), attention.to(device)
         loss = mlm_loss(torch, model, input_ids, attention, tokenizer,
                         args.mask_probability, generator)
-        window_size = min(accumulation_steps, batch_count - batch_index)
+        window_size = gradient_accumulation_window_size(
+            batch_index, batch_count, accumulation_steps)
         (loss / window_size).backward()
         if (batch_index + 1) % accumulation_steps == 0 or batch_index + 1 == batch_count:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.pretrain_max_grad_norm)
@@ -789,7 +796,8 @@ def train_downstream_epoch(torch, model, loader, optimizer, scheduler, spec, arg
             torch, supervised_logits(
                 torch, model, input_ids, attention, args.finetune_noise_probability,
                 args.finetune_noise_std, generator), labels, spec)
-        window_size = min(accumulation_steps, batch_count - batch_index)
+        window_size = gradient_accumulation_window_size(
+            batch_index, batch_count, accumulation_steps)
         (loss / window_size).backward()
         if (batch_index + 1) % accumulation_steps == 0 or batch_index + 1 == batch_count:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.finetune_max_grad_norm)

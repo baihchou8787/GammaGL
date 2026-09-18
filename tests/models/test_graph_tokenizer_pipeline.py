@@ -4,7 +4,6 @@ import json
 import math
 import pickle
 import random
-import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -123,20 +122,6 @@ def test_training_requires_prepared_data_without_network(trainer, tmp_path, monk
 
     with pytest.raises(FileNotFoundError, match="GraphTokenizer dataset is not prepared"):
         trainer.load_dataset_splits(str(tmp_path / "empty"), trainer.resolve_dataset("qm9"))
-
-
-def test_exclusive_gpu_launcher_explains_compute_mode_cleanup():
-    launcher = ROOT / "examples" / "graph_tokenizer" / "run_exclusive_gpu.sh"
-    source = launcher.read_text()
-
-    result = subprocess.run(
-        ["bash", str(launcher), "--help"], text=True, capture_output=True, check=False)
-
-    assert result.returncode == 0
-    assert "EXCLUSIVE_PROCESS" in result.stdout
-    assert "恢复 Default" in result.stdout
-    assert "sudo -n" in source
-    assert "release_lock" in source
 
 
 @pytest.mark.parametrize("split_name", ("train", "val", "test"))
@@ -396,6 +381,111 @@ def test_phase_training_accumulates_gradients_before_optimizer_step(trainer, mon
 
     assert len(optimizer_steps) == 2
     assert scheduler.steps == 2
+
+
+@pytest.mark.parametrize(
+    ("batch_count", "accumulation_steps", "expected"),
+    [
+        (6, 4, [4, 4, 4, 4, 2, 2]),
+        (8, 4, [4, 4, 4, 4, 4, 4, 4, 4]),
+        (3, 1, [1, 1, 1]),
+        (3, 4, [3, 3, 3]),
+    ],
+)
+def test_gradient_accumulation_window_size_uses_the_full_window(
+        trainer, batch_count, accumulation_steps, expected):
+    assert [
+        trainer.gradient_accumulation_window_size(
+            batch_index, batch_count, accumulation_steps)
+        for batch_index in range(batch_count)
+    ] == expected
+
+
+def _accumulated_gradients(trainer, monkeypatch, path, batch_gradients, accumulation_steps):
+    class CountingScheduler:
+        def __init__(self):
+            self.steps = 0
+
+        def step(self):
+            self.steps += 1
+
+    class ScalarModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    model = ScalarModel()
+    loader = [
+        (torch.tensor([[gradient]]), torch.ones((1, 1), dtype=torch.long),
+         torch.tensor([[0.0]]), torch.tensor([batch_index]))
+        for batch_index, gradient in enumerate(batch_gradients)
+    ]
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    gradients = []
+    original_step = optimizer.step
+
+    def capture_gradient_then_step():
+        gradients.append(float(model.scale.grad))
+        original_step()
+
+    monkeypatch.setattr(optimizer, "step", capture_gradient_then_step)
+    scheduler = CountingScheduler()
+    if path == "mlm":
+        tokenizer = SimpleNamespace(special_tokens=SimpleNamespace(
+            pad_token_id=0, cls_token_id=3, sep_token_id=4,
+            component_sep_token_id=5, mask_token_id=6), vocabulary={7: 7})
+
+        def known_mlm_loss(_torch, _model, input_ids, *_args):
+            return model.scale * input_ids[0, 0].float()
+
+        monkeypatch.setattr(trainer, "mlm_loss", known_mlm_loss)
+        epoch_loss = trainer.train_mlm_epoch(
+            torch, model, loader, optimizer, scheduler, tokenizer,
+            SimpleNamespace(mask_probability=1.0, pretrain_max_grad_norm=1e6,
+                            gradient_accumulation_steps=accumulation_steps),
+            torch.device("cpu"), seed=7)
+    else:
+        def known_logits(_torch, _model, input_ids, *_args):
+            return model.scale * input_ids[:, 0].float()
+
+        monkeypatch.setattr(trainer, "supervised_logits", known_logits)
+        monkeypatch.setattr(trainer, "supervised_loss", lambda _torch, logits, *_args: logits.mean())
+        epoch_loss = trainer.train_downstream_epoch(
+            torch, model, loader, optimizer, scheduler, trainer.resolve_dataset("qm9"),
+            SimpleNamespace(finetune_max_grad_norm=1e6, finetune_noise_probability=0.0,
+                            finetune_noise_std=0.0,
+                            gradient_accumulation_steps=accumulation_steps),
+            torch.device("cpu"))
+    return gradients, scheduler.steps, epoch_loss
+
+
+@pytest.mark.parametrize("path", ("mlm", "downstream"))
+def test_training_accumulation_averages_each_partial_window(
+        trainer, monkeypatch, path):
+    gradients, scheduler_steps, epoch_loss = _accumulated_gradients(
+        trainer, monkeypatch, path, [1, 2, 3, 4, 5, 6], accumulation_steps=4)
+
+    assert gradients == pytest.approx([2.5, 5.5])
+    assert scheduler_steps == 2
+    assert epoch_loss == pytest.approx(3.5)
+
+
+@pytest.mark.parametrize(
+    ("batch_gradients", "accumulation_steps", "expected_gradients"),
+    [
+        ([1, 2, 3, 4, 5, 6, 7, 8], 4, [2.5, 6.5]),
+        ([1, 2, 3], 1, [1.0, 2.0, 3.0]),
+        ([1, 2, 3], 4, [2.0]),
+    ],
+)
+@pytest.mark.parametrize("path", ("mlm", "downstream"))
+def test_training_accumulation_matches_complete_and_short_windows(
+        trainer, monkeypatch, path, batch_gradients, accumulation_steps, expected_gradients):
+    gradients, scheduler_steps, _ = _accumulated_gradients(
+        trainer, monkeypatch, path, batch_gradients, accumulation_steps)
+
+    assert gradients == pytest.approx(expected_gradients)
+    assert scheduler_steps == len(expected_gradients)
 
 
 def test_set_seed_controls_python_numpy_torch_cuda_and_cudnn(trainer, monkeypatch):

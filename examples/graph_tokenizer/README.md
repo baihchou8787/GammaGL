@@ -76,27 +76,10 @@ merge、最小频率 2）、100 次序列化、0.1 的权重衰减、0.12 / 0.02
 
 ### Peptides-struct + GTE 显存修复与预处理缓存（2026-09-17）
 
-该 preset 使用 batch size=4 并累积 4 个 micro-batch 后更新一次参数，保持等效 batch size=16，
-以避免 batch size=16 在 24 GiB GPU 上的 GTE MLM 前向 OOM。正式训练会将已拟合的 tokenizer 和
+该 preset 为降低单步显存占用，使用 batch size=4 并累积 4 个 micro-batch 后执行一次参数更新；
+每次 optimizer update 名义上累计 16 个样本的梯度，以避免 batch size=16 在 24 GiB GPU 上的 GTE MLM 前向 OOM。正式训练会将已拟合的 tokenizer 和
 编码后的 train/val/test records 写入 `DATA_ROOT/.graph_tokenizer_preprocessing_cache/`；后续同配置的 seed
 直接复用该缓存，运行时数据增强仍按各自 seed 生成。可用 `--preprocessing-cache-dir PATH` 改变缓存位置。
-
-### 强制独占 GPU 启动（2026-09-17）
-
-需要避免与任何其他 CUDA 训练任务共用同一张卡时，使用
-`run_exclusive_gpu.sh` 启动，而不是直接设置 `CUDA_VISIBLE_DEVICES`：它只会选择没有 CUDA
-计算进程的 GPU，将该卡临时切换到 NVIDIA `EXCLUSIVE_PROCESS` 计算模式，并在训练退出（包括失败和
-中断）时恢复 `Default`。例如：
-
-```bash
-examples/graph_tokenizer/run_exclusive_gpu.sh qm9_bert runs/qm9_bert \
-  env TL_BACKEND=torch PYTHONUNBUFFERED=1 python examples/graph_tokenizer/graph_tokenizer_trainer.py \
-  --dataset qm9 --encoder bert --data-root data --device cuda --output-dir runs/qm9_bert
-```
-
-该模式需要管理员预先授予当前用户免密执行 `nvidia-smi -c EXCLUSIVE_PROCESS` 与
-`nvidia-smi -c DEFAULT` 的权限；没有该权限时启动器会停止，不会静默退化为共享 GPU。它不会终止已在
-运行的其他任务，因此只在候选 GPU 没有计算进程时才会取得独占。
 
 ### MolHIV + GTE 显存修复（2026-09-14）
 
