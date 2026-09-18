@@ -10,9 +10,11 @@ native HF-to-TLX converter.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import pickle
 import random
 import statistics
 import sys
@@ -38,6 +40,7 @@ DATASETS = (
 )
 
 DEFAULT_SEEDS = (42, 43, 44, 45, 46)
+PREPROCESSING_CACHE_VERSION = 1
 
 
 # GammaGL presets derived from the pinned official GraphTokenizer implementation.
@@ -71,6 +74,7 @@ _BASE_CONFIG = {
     "finetune_mask_ratio": 0.05,
     "finetune_noise_probability": 0.3,
     "finetune_noise_std": 0.01,
+    "gradient_accumulation_steps": 1,
     "pooling": "mean",
 }
 PAPER_CONFIGS = {
@@ -79,10 +83,11 @@ PAPER_CONFIGS = {
                         "max_length": 8096, "max_position_embeddings": 8192},
     ("molhiv", "bert"): {**_BASE_CONFIG, "learning_rate": 5e-5},
     ("molhiv", "gte"): {**_BASE_CONFIG, "pretrain_learning_rate": 5e-5,
-                           "learning_rate": 5e-5, "max_length": 8096,
+                           "learning_rate": 5e-5, "batch_size": 8, "max_length": 8096,
                            "max_position_embeddings": 8192},
     ("peptides-struct", "bert"): {**_BASE_CONFIG, "batch_size": 16},
-    ("peptides-struct", "gte"): {**_BASE_CONFIG, "batch_size": 16,
+    ("peptides-struct", "gte"): {**_BASE_CONFIG, "batch_size": 4,
+                                    "gradient_accumulation_steps": 4,
                                     "max_length": 8096, "max_position_embeddings": 8192},
 }
 
@@ -291,6 +296,61 @@ def synthetic_splits(spec: DatasetSpec) -> Dict[str, List[GraphRecord]]:
         GraphRecord([[0, 1], [1, 2]], [1, 4, 2], [3, 1], labels[4]),
     ]
     return {"train": graphs[:3], "val": graphs[3:4], "test": graphs[4:]}
+
+
+def preprocessing_cache_path(args, spec: DatasetSpec) -> Path:
+    cache_root = Path(getattr(args, "preprocessing_cache_dir", None)
+                      or Path(args.data_root) / ".graph_tokenizer_preprocessing_cache")
+    raw_name = "ogbg-molhiv" if spec.name == "molhiv" else spec.name
+    raw_dir = Path(args.data_root) / raw_name / "raw"
+    source_files = []
+    if raw_dir.exists():
+        for path in sorted(item for item in raw_dir.rglob("*") if item.is_file()):
+            stat = path.stat()
+            source_files.append((str(path.relative_to(raw_dir)), stat.st_size, stat.st_mtime_ns))
+    signature = {
+        "version": PREPROCESSING_CACHE_VERSION,
+        "dataset": spec.name,
+        "encoder": args.encoder,
+        "bpe_merges": args.bpe_merges,
+        "bpe_min_frequency": args.bpe_min_frequency,
+        "bpe_backend": args.bpe_backend,
+        "num_serializations": args.num_serializations,
+        "max_length": args.max_length,
+        "source_files": source_files,
+    }
+    digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode("utf-8")).hexdigest()
+    return cache_root / f"{spec.name}-{args.encoder}-{digest}.pickle"
+
+
+def load_or_prepare_preprocessing(args, spec: DatasetSpec):
+    cache_path = preprocessing_cache_path(args, spec)
+    try:
+        with cache_path.open("rb") as handle:
+            cached = pickle.load(handle)
+    except FileNotFoundError:
+        cached = None
+    except (EOFError, ImportError, pickle.UnpicklingError):
+        cache_path.unlink(missing_ok=True)
+        cached = None
+    if cached is not None:
+        emit_event("preprocessing_cache", status="hit", path=str(cache_path))
+        return (cached["tokenizer"], cached["encoded"], cached["normalizer"],
+                cached["output_dim"])
+
+    splits = load_dataset_splits(args.data_root, spec)
+    tokenizer = make_tokenizer(args, splits["train"])
+    encoded = encode_splits(tokenizer, splits, args)
+    normalizer, output_dim = normalize_labels(encoded, spec)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_name(f".{cache_path.name}.tmp-{os.getpid()}")
+    with temporary.open("wb") as handle:
+        pickle.dump({"tokenizer": tokenizer, "encoded": encoded,
+                     "normalizer": normalizer, "output_dim": output_dim}, handle,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temporary, cache_path)
+    emit_event("preprocessing_cache", status="created", path=str(cache_path))
+    return tokenizer, encoded, normalizer, output_dim
 
 
 def make_tokenizer(args, train_graphs: Sequence[GraphRecord]):
@@ -611,19 +671,35 @@ def restore_checkpoint(torch, path: Path, model, device):
     return state
 
 
+def gradient_accumulation_steps(args) -> int:
+    steps = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+    if steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive.")
+    return steps
+
+
+def optimizer_steps_per_epoch(loader, args) -> int:
+    return math.ceil(len(loader) / gradient_accumulation_steps(args))
+
+
 def train_mlm_epoch(torch, model, loader, optimizer, scheduler, tokenizer, args, device, seed):
     set_model_mode(model, True)
     generator = torch.Generator(device=device).manual_seed(seed)
     total, count = 0.0, 0
-    for input_ids, attention, _, _ in loader:
+    accumulation_steps = gradient_accumulation_steps(args)
+    batch_count = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+    for batch_index, (input_ids, attention, _, _) in enumerate(loader):
         input_ids, attention = input_ids.to(device), attention.to(device)
-        optimizer.zero_grad(set_to_none=True)
         loss = mlm_loss(torch, model, input_ids, attention, tokenizer,
                         args.mask_probability, generator)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.pretrain_max_grad_norm)
-        optimizer.step()
-        scheduler.step()
+        window_size = min(accumulation_steps, batch_count - batch_index)
+        (loss / window_size).backward()
+        if (batch_index + 1) % accumulation_steps == 0 or batch_index + 1 == batch_count:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.pretrain_max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
         total += float(loss.detach()) * len(input_ids)
         count += len(input_ids)
     return total / max(count, 1)
@@ -633,7 +709,7 @@ def run_mlm(torch, model, train_loader, tokenizer, args, device):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.pretrain_learning_rate,
                                   weight_decay=args.weight_decay)
     scheduler = build_warmup_cosine_scheduler(
-        torch, optimizer, total_steps=len(train_loader) * args.pretrain_epochs,
+        torch, optimizer, total_steps=optimizer_steps_per_epoch(train_loader, args) * args.pretrain_epochs,
         warmup_ratio=args.pretrain_warmup_ratio)
     history = []
     for epoch in range(1, args.pretrain_epochs + 1):
@@ -704,17 +780,22 @@ def train_downstream_epoch(torch, model, loader, optimizer, scheduler, spec, arg
     set_model_mode(model, True)
     generator = torch.Generator(device=device).manual_seed(seed)
     total, count = 0.0, 0
-    for input_ids, attention, labels, _ in loader:
+    accumulation_steps = gradient_accumulation_steps(args)
+    batch_count = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+    for batch_index, (input_ids, attention, labels, _) in enumerate(loader):
         input_ids, attention, labels = input_ids.to(device), attention.to(device), labels.to(device)
-        optimizer.zero_grad(set_to_none=True)
         loss = supervised_loss(
             torch, supervised_logits(
                 torch, model, input_ids, attention, args.finetune_noise_probability,
                 args.finetune_noise_std, generator), labels, spec)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.finetune_max_grad_norm)
-        optimizer.step()
-        scheduler.step()
+        window_size = min(accumulation_steps, batch_count - batch_index)
+        (loss / window_size).backward()
+        if (batch_index + 1) % accumulation_steps == 0 or batch_index + 1 == batch_count:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.finetune_max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
         total += float(loss.detach()) * len(input_ids)
         count += len(input_ids)
     return total / max(count, 1)
@@ -723,7 +804,7 @@ def train_downstream_epoch(torch, model, loader, optimizer, scheduler, spec, arg
 def run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, normalizer, args, device, checkpoint):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = build_warmup_cosine_scheduler(
-        torch, optimizer, total_steps=len(train_loader) * args.finetune_epochs,
+        torch, optimizer, total_steps=optimizer_steps_per_epoch(train_loader, args) * args.finetune_epochs,
         warmup_ratio=args.finetune_warmup_ratio)
     best, stale, history = None, 0, []
     higher_is_better = spec.name == "molhiv"
@@ -759,6 +840,7 @@ def apply_preset(args, config=None):
     if args.max_length > args.max_position_embeddings:
         raise ValueError(
             "max_length must not exceed max_position_embeddings.")
+    gradient_accumulation_steps(args)
     return args
 
 
@@ -781,14 +863,17 @@ def run_single_experiment(args, config, seed, run_index=0):
     torch = ensure_torch_backend()
     set_seed(torch, args.seed)
     spec = resolve_dataset(args.dataset)
-    splits = synthetic_splits(spec) if args.smoke else load_dataset_splits(args.data_root, spec)
     emit_event("stage", stage="tokenizer_fit", status="started")
-    tokenizer = make_tokenizer(args, splits["train"])
+    if args.smoke:
+        splits = synthetic_splits(spec)
+        tokenizer = make_tokenizer(args, splits["train"])
+        encoded = encode_splits(tokenizer, splits, args)
+        normalizer, output_dim = normalize_labels(encoded, spec)
+    else:
+        tokenizer, encoded, normalizer, output_dim = load_or_prepare_preprocessing(args, spec)
     emit_event("stage", stage="tokenizer_fit", status="completed")
     emit_event("stage", stage="encoding", status="started")
-    encoded = encode_splits(tokenizer, splits, args)
     emit_event("stage", stage="encoding", status="completed")
-    normalizer, output_dim = normalize_labels(encoded, spec)
     tokenizer.validate_model_vocab(tokenizer.max_token_id + 1)
     device = torch.device(args.device)
     model = make_model(args, tokenizer.max_token_id + 1, tokenizer.special_tokens.pad_token_id, output_dim).to(device)
@@ -852,6 +937,7 @@ def build_parser():
     parser.add_argument("--bpe-merges", "--num-merges", dest="bpe_merges", type=int)
     parser.add_argument("--bpe-min-frequency", "--min-frequency", dest="bpe_min_frequency", type=int)
     parser.add_argument("--bpe-backend", choices=("python", "auto", "cpp"), default="python")
+    parser.add_argument("--preprocessing-cache-dir")
     parser.add_argument("--num-serializations", "--num-realizations", dest="num_serializations", type=int)
     parser.add_argument("--early-stopping-patience", "--patience", dest="early_stopping_patience", type=int)
     parser.add_argument("--mask-probability", "--mask-prob", dest="mask_probability", type=float)
@@ -870,6 +956,7 @@ def build_parser():
     parser.add_argument("--finetune-mask-ratio", type=float)
     parser.add_argument("--finetune-noise-probability", type=float)
     parser.add_argument("--finetune-noise-std", type=float)
+    parser.add_argument("--gradient-accumulation-steps", type=int)
     parser.add_argument("--pooling", choices=("mean", "cls"))
     seed_options = parser.add_mutually_exclusive_group()
     seed_options.add_argument("--seed", type=int,

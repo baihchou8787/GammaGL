@@ -51,9 +51,9 @@ merge、最小频率 2）、100 次序列化、0.1 的权重衰减、0.12 / 0.02
 | QM9 + BERT | 32 | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
 | QM9 + GTE | 32 | 5e-5 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
 | MolHIV + BERT | 32 | 1e-4 / 5e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
-| MolHIV + GTE | 32 | 5e-5 / 5e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
+| MolHIV + GTE | 8 | 5e-5 / 5e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
 | Peptides-struct + BERT | 16 | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 512 隐藏维、4 层、4 头、2048 FFN、位置容量 8096 | 不适用 |
-| Peptides-struct + GTE | 16 | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
+| Peptides-struct + GTE | 4（累积 4 步） | 1e-4 / 1e-5 | 200 / 200 | 8096 | 2000 / 训练集派生 | 100 | 20 | 0.1 | 42–46（默认 CLI） | 768 隐藏维、12 层、12 头、3072 FFN、RoPE、位置容量 8192 | `Alibaba-NLP/gte-multilingual-base` `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`* |
 
 ### 序列长度与位置容量的来源
 
@@ -73,6 +73,37 @@ merge、最小频率 2）、100 次序列化、0.1 的权重衰减、0.12 / 0.02
 源码随附 GTE 的位置容量：
 [`gte_model/config.json`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/blob/98343a6b025a48fbb6859cd812a12b81ec3ac3cc/gte_model/config.json#L32)；
 前者则是当前入口的最终输入限制，仍与该位置容量相互独立。
+
+### Peptides-struct + GTE 显存修复与预处理缓存（2026-09-17）
+
+该 preset 使用 batch size=4 并累积 4 个 micro-batch 后更新一次参数，保持等效 batch size=16，
+以避免 batch size=16 在 24 GiB GPU 上的 GTE MLM 前向 OOM。正式训练会将已拟合的 tokenizer 和
+编码后的 train/val/test records 写入 `DATA_ROOT/.graph_tokenizer_preprocessing_cache/`；后续同配置的 seed
+直接复用该缓存，运行时数据增强仍按各自 seed 生成。可用 `--preprocessing-cache-dir PATH` 改变缓存位置。
+
+### 强制独占 GPU 启动（2026-09-17）
+
+需要避免与任何其他 CUDA 训练任务共用同一张卡时，使用
+`run_exclusive_gpu.sh` 启动，而不是直接设置 `CUDA_VISIBLE_DEVICES`：它只会选择没有 CUDA
+计算进程的 GPU，将该卡临时切换到 NVIDIA `EXCLUSIVE_PROCESS` 计算模式，并在训练退出（包括失败和
+中断）时恢复 `Default`。例如：
+
+```bash
+examples/graph_tokenizer/run_exclusive_gpu.sh qm9_bert runs/qm9_bert \
+  env TL_BACKEND=torch PYTHONUNBUFFERED=1 python examples/graph_tokenizer/graph_tokenizer_trainer.py \
+  --dataset qm9 --encoder bert --data-root data --device cuda --output-dir runs/qm9_bert
+```
+
+该模式需要管理员预先授予当前用户免密执行 `nvidia-smi -c EXCLUSIVE_PROCESS` 与
+`nvidia-smi -c DEFAULT` 的权限；没有该权限时启动器会停止，不会静默退化为共享 GPU。它不会终止已在
+运行的其他任务，因此只在候选 GPU 没有计算进程时才会取得独占。
+
+### MolHIV + GTE 显存修复（2026-09-14）
+
+该 preset 的 batch size 固定为 8。此前 batch size=32 在约 688 token 的 batch 上会为 GTE 的
+全量注意力 score tensor 额外申请约 694 MiB，导致 24 GiB GPU 在 MLM 前向阶段发生 CUDA OOM。
+该调整保留 8096 的严格序列长度上限和完整图序列协议；如需恢复等效 batch size 32，应使用梯度累积，
+而不是将单卡 batch size 调回 32。
 
 ### 与原始 benchmark 工作流的差异
 

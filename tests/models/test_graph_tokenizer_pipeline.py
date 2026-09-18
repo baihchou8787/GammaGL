@@ -4,6 +4,7 @@ import json
 import math
 import pickle
 import random
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -124,6 +125,20 @@ def test_training_requires_prepared_data_without_network(trainer, tmp_path, monk
         trainer.load_dataset_splits(str(tmp_path / "empty"), trainer.resolve_dataset("qm9"))
 
 
+def test_exclusive_gpu_launcher_explains_compute_mode_cleanup():
+    launcher = ROOT / "examples" / "graph_tokenizer" / "run_exclusive_gpu.sh"
+    source = launcher.read_text()
+
+    result = subprocess.run(
+        ["bash", str(launcher), "--help"], text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0
+    assert "EXCLUSIVE_PROCESS" in result.stdout
+    assert "恢复 Default" in result.stdout
+    assert "sudo -n" in source
+    assert "release_lock" in source
+
+
 @pytest.mark.parametrize("split_name", ("train", "val", "test"))
 def test_encode_splits_rejects_overlong_sequences_for_every_split(trainer, split_name):
     args = SimpleNamespace(dataset="qm9", num_serializations=1, max_length=8)
@@ -234,12 +249,49 @@ def test_paper_preset_uses_phase_specific_warmup_and_gradient_clipping(trainer):
     assert args.finetune_warmup_ratio == 0.025
     assert args.pretrain_max_grad_norm == 2.0
     assert args.finetune_max_grad_norm == 0.5
+    assert args.batch_size == 8
     assert (args.pretrain_swap_probability, args.pretrain_swap_ratio,
             args.pretrain_swap_window) == (0.5, 0.10, 3)
     assert (args.finetune_swap_probability, args.finetune_swap_ratio,
             args.finetune_swap_window) == (0.4, 0.05, 3)
     assert (args.finetune_mask_probability, args.finetune_mask_ratio) == (0.3, 0.05)
     assert (args.finetune_noise_probability, args.finetune_noise_std) == (0.3, 0.01)
+
+
+def test_peptides_struct_gte_preset_uses_memory_safe_micro_batches(trainer):
+    args = trainer.apply_preset(trainer.build_parser().parse_args([
+        "--dataset", "peptides-struct", "--encoder", "gte",
+    ]))
+
+    assert args.batch_size == 4
+    assert args.gradient_accumulation_steps == 4
+
+
+def test_preprocessing_cache_reuses_fitted_tokenizer_and_encoded_splits(
+        trainer, tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        dataset="qm9", encoder="bert", data_root=str(tmp_path / "data"),
+        preprocessing_cache_dir=str(tmp_path / "cache"), bpe_merges=2,
+        bpe_min_frequency=2, bpe_backend="python", num_serializations=1,
+        max_length=64)
+    spec = trainer.resolve_dataset("qm9")
+    splits = {"train": _qm9_graphs(trainer, 3),
+              "val": _qm9_graphs(trainer, 1, offset=3),
+              "test": _qm9_graphs(trainer, 1, offset=4)}
+    monkeypatch.setattr(trainer, "load_dataset_splits", lambda *_: splits)
+
+    first_tokenizer, first_encoded, first_normalizer, first_output_dim = (
+        trainer.load_or_prepare_preprocessing(args, spec))
+    monkeypatch.setattr(trainer, "load_dataset_splits",
+                        lambda *_: pytest.fail("cache hit must not reload raw data"))
+    second_tokenizer, second_encoded, second_normalizer, second_output_dim = (
+        trainer.load_or_prepare_preprocessing(args, spec))
+
+    assert second_tokenizer.vocabulary == first_tokenizer.vocabulary
+    assert second_encoded == first_encoded
+    assert second_normalizer == first_normalizer
+    assert second_output_dim == first_output_dim == 1
+    assert len(list((tmp_path / "cache").glob("*.pickle"))) == 1
 
 
 def test_warmup_cosine_scheduler_warms_up_then_decays(trainer):
@@ -284,7 +336,7 @@ def test_phase_training_uses_phase_specific_gradient_clipping(trainer, monkeypat
                         lambda _parameters, max_norm: clipped.append(max_norm))
     tokenizer = SimpleNamespace(special_tokens=SimpleNamespace(
         pad_token_id=0, cls_token_id=3, sep_token_id=4,
-        component_sep_token_id=5, mask_token_id=6))
+        component_sep_token_id=5, mask_token_id=6), vocabulary={7: 7})
     loader = [(torch.tensor([[3, 2, 4]]), torch.ones((1, 3), dtype=torch.long),
                torch.tensor([[1.0]]), torch.tensor([0]))]
     mlm_model = TinyMLM()
@@ -307,6 +359,43 @@ def test_phase_training_uses_phase_specific_gradient_clipping(trainer, monkeypat
     assert clipped == [2.0, 0.5]
     assert mlm_scheduler.steps == 1
     assert supervised_scheduler.steps == 1
+
+
+def test_phase_training_accumulates_gradients_before_optimizer_step(trainer, monkeypatch):
+    class CountingScheduler:
+        def __init__(self):
+            self.steps = 0
+
+        def step(self):
+            self.steps += 1
+
+    class TinyMLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, input_ids, attention, task):
+            return self.scale * torch.ones((len(input_ids), input_ids.shape[1], 7))
+
+    tokenizer = SimpleNamespace(special_tokens=SimpleNamespace(
+        pad_token_id=0, cls_token_id=3, sep_token_id=4,
+        component_sep_token_id=5, mask_token_id=6), vocabulary={7: 7})
+    loader = [(torch.tensor([[3, 2, 4]]), torch.ones((1, 3), dtype=torch.long),
+               torch.tensor([[1.0]]), torch.tensor([0])) for _ in range(3)]
+    model = TinyMLM()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer_steps = []
+    original_step = optimizer.step
+    monkeypatch.setattr(optimizer, "step", lambda: (optimizer_steps.append(1), original_step())[1])
+    scheduler = CountingScheduler()
+
+    trainer.train_mlm_epoch(
+        torch, model, loader, optimizer, scheduler, tokenizer,
+        SimpleNamespace(mask_probability=1.0, pretrain_max_grad_norm=2.0,
+                        gradient_accumulation_steps=2), torch.device("cpu"), seed=7)
+
+    assert len(optimizer_steps) == 2
+    assert scheduler.steps == 2
 
 
 def test_set_seed_controls_python_numpy_torch_cuda_and_cudnn(trainer, monkeypatch):
