@@ -1,10 +1,11 @@
+import pickle
 import random
 
 import pytest
 
 from gammagl.transforms.graph_bpe import GraphBPE
 from gammagl.transforms.graph_serializer import FrequencyGuidedEulerianSerializer
-from gammagl.transforms.graph_tokenizer import GraphTokenizer
+from gammagl.transforms.graph_tokenizer import GraphTokenizer, GraphTokenizerSpecialTokens
 
 
 class SimpleGraph:
@@ -174,6 +175,78 @@ def test_tokenizer_does_not_expand_train_vocabulary_for_held_out_tokens():
 
     assert tokenizer.vocabulary == vocabulary
     assert tokenizer.special_tokens.unk_token_id in encoded.input_ids
+
+
+def _token_collision_graphs():
+    train = {"edge_index": [[0], [1]], "x": [1, 2], "edge_attr": [1], "num_nodes": 2}
+    return train, {**train, "x": [1, 3]}
+
+
+def test_tokenizer_maps_unknown_raw_tokens_to_unk_before_bpe_merges():
+    train, held_out = _token_collision_graphs()
+    tokenizer = GraphTokenizer().fit([train, train])
+    held_out_tokens = tokenizer._normalize_serialized_tokens(
+        tokenizer.serializer.serialize(held_out).token_ids)
+    collision_id = next(token for token in held_out_tokens
+                        if token in {rule[2] for rule in tokenizer.bpe.codebook.merge_rules})
+
+    encoded = tokenizer.encode_graph(held_out)
+
+    assert tokenizer.special_tokens.unk_token_id in encoded.input_ids
+    assert encoded.input_ids == [3, 13, 11, 1, 17, 4]
+    assert collision_id not in tokenizer.original_token_ids
+
+
+def test_tokenizer_unknown_tokens_and_special_tokens_are_bpe_boundaries():
+    train, _ = _token_collision_graphs()
+    tokenizer = GraphTokenizer().fit([train, train])
+    left, right, merged = tokenizer.bpe.codebook.merge_rules[0]
+    tokenizer.bpe.codebook.merge_rules.extend([
+        (merged, tokenizer.special_tokens.unk_token_id, merged + 100),
+        (merged, tokenizer.special_tokens.mask_token_id, merged + 101),
+    ])
+
+    unknown = max(tokenizer.original_token_ids) + 1000
+    encoded_unknown = tokenizer.encode_tokens([left, right, unknown, left, right])
+    encoded_masked = tokenizer.encode_tokens([
+        left, right, tokenizer.special_tokens.mask_token_id, left, right])
+
+    assert tokenizer.special_tokens.unk_token_id in tokenizer.bpe.protected_token_ids
+    assert tokenizer.special_tokens.mask_token_id in tokenizer.bpe.protected_token_ids
+    assert encoded_unknown == [3, 13, 1, 13, 4]
+    assert encoded_masked == [3, 13, tokenizer.special_tokens.mask_token_id, 13, 4]
+
+
+@pytest.mark.parametrize(
+    "special_tokens",
+    [GraphTokenizerSpecialTokens(), GraphTokenizerSpecialTokens(pad_token_id=1, unk_token_id=0)],
+    ids=("bert", "gte"),
+)
+def test_tokenizer_uses_configured_unk_for_non_colliding_unknown_tokens(special_tokens):
+    train, held_out = _token_collision_graphs()
+    tokenizer = GraphTokenizer(special_tokens=special_tokens).fit([train, train])
+    non_colliding = {**held_out, "x": [1, 101]}
+
+    encoded = tokenizer.encode_graph(non_colliding)
+
+    assert special_tokens.unk_token_id in encoded.input_ids
+    assert tokenizer.encode_graph(train).input_ids == [3, 18, 4]
+
+
+def test_tokenizer_batch_encoding_and_persistence_reuse_original_token_ids():
+    train, held_out = _token_collision_graphs()
+    tokenizer = GraphTokenizer().fit([train, train])
+    restored = pickle.loads(pickle.dumps(tokenizer))
+
+    single = [tokenizer.encode_graph(graph).input_ids for graph in (train, held_out)]
+    batch = [result.input_ids for result in tokenizer.batch_encode_graphs([train, held_out])]
+
+    assert batch == single
+    assert restored.original_token_ids == tokenizer.original_token_ids
+    assert restored.encode_graph(held_out).input_ids == tokenizer.encode_graph(held_out).input_ids
+    del restored.original_token_ids
+    with pytest.raises(RuntimeError, match="re-fit"):
+        restored.encode_graph(train)
 
 
 def test_tokenizer_rejects_unfitted_and_overlong_sequences():

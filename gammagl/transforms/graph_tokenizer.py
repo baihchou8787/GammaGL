@@ -60,17 +60,15 @@ class GraphTokenizer(BaseTransform):
         self.serializer = serializer or FrequencyGuidedEulerianSerializer()
         self.bpe = bpe or GraphBPE()
         self.special_tokens = special_tokens or GraphTokenizerSpecialTokens()
-        if not hasattr(self.bpe, "protected_token_ids"):
-            self.bpe.protected_token_ids = set()
-        self.bpe.protected_token_ids.add(
-            self.special_tokens.component_sep_token_id)
+        self._protect_special_tokens()
         self.add_special_tokens = bool(add_special_tokens)
         self._fitted = False
         self.vocabulary = {}
         self.id_to_vocabulary_token = {}
+        self.original_token_ids = None
         self.fit_graph_ids_hash = None
         self.fit_num_realizations = 1
-        self.schema_version = 1
+        self.schema_version = 2
 
     def fit(self, graphs, graph_ids=None, num_realizations: int = 1):
         graphs = list(graphs)
@@ -87,6 +85,7 @@ class GraphTokenizer(BaseTransform):
                 raise ValueError("graph_ids must align with the training graphs.")
             self.fit_graph_ids_hash = hashlib.sha256(
                 repr(tuple(graph_ids)).encode("utf-8")).hexdigest()
+        self._protect_special_tokens()
         self.serializer.fit(graphs)
         serialized_sequences = []
         for graph in graphs:
@@ -95,6 +94,8 @@ class GraphTokenizer(BaseTransform):
                 serialized_sequences.append(self._normalize_serialized_tokens(
                     self.serializer.serialize(
                         graph, start_node=start_node).token_ids))
+        self.original_token_ids = {
+            int(token) for sequence in serialized_sequences for token in sequence}
         self.bpe.fit(serialized_sequences)
         # Match the official protocol: BPE IDs are an intermediate alphabet,
         # then a frozen train-built contiguous vocabulary maps them to model IDs.
@@ -112,7 +113,7 @@ class GraphTokenizer(BaseTransform):
         return self
 
     def encode_tokens(self, token_ids: List[int]) -> List[int]:
-        encoded = self._vocabulary_encode(self.bpe.encode(token_ids))
+        encoded = self._encode_token_sequences([token_ids])[0]
         if not self.add_special_tokens:
             return encoded
         return [self.special_tokens.cls_token_id, *encoded, self.special_tokens.sep_token_id]
@@ -213,10 +214,7 @@ class GraphTokenizer(BaseTransform):
             self._normalize_serialized_tokens(result.token_ids)
             for result in serialized_results
         ]
-        encoded_sequences = [
-            self._vocabulary_encode(sequence)
-            for sequence in self.bpe.batch_encode(serialized_token_ids)
-        ]
+        encoded_sequences = self._encode_token_sequences(serialized_token_ids)
         results = []
         for serialized, normalized, encoded in zip(
                 serialized_results, serialized_token_ids, encoded_sequences):
@@ -261,6 +259,23 @@ class GraphTokenizer(BaseTransform):
                 normalized.append(token + reserved_token_count)
         return normalized
 
+    def _encode_token_sequences(self, token_sequences) -> List[List[int]]:
+        self._require_fitted()
+        prepared_sequences = [
+            self._prepare_bpe_tokens(token_ids) for token_ids in token_sequences]
+        return [
+            self._vocabulary_encode(token_ids)
+            for token_ids in self.bpe.batch_encode(prepared_sequences)
+        ]
+
+    def _prepare_bpe_tokens(self, token_ids: List[int]) -> List[int]:
+        special_ids = self._special_token_ids()
+        return [
+            token if token in self.original_token_ids or token in special_ids
+            else self.special_tokens.unk_token_id
+            for token in map(int, token_ids)
+        ]
+
     def _denormalize_serialized_tokens(self, token_ids: List[int]) -> List[int]:
         reserved_token_count = self._reserved_token_count()
         denormalized = []
@@ -286,8 +301,16 @@ class GraphTokenizer(BaseTransform):
             self.special_tokens.component_sep_token_id,
         ) + 1
 
+    def _special_token_ids(self):
+        return set(vars(self.special_tokens).values())
+
+    def _protect_special_tokens(self) -> None:
+        if not hasattr(self.bpe, "protected_token_ids"):
+            self.bpe.protected_token_ids = set()
+        self.bpe.protected_token_ids.update(self._special_token_ids())
+
     def _vocabulary_encode(self, token_ids: List[int]) -> List[int]:
-        special_ids = set(vars(self.special_tokens).values())
+        special_ids = self._special_token_ids()
         return [
             int(token) if int(token) in special_ids
             else self.vocabulary.get(int(token), self.special_tokens.unk_token_id)
@@ -398,6 +421,9 @@ class GraphTokenizer(BaseTransform):
     def _require_fitted(self) -> None:
         if not self._fitted:
             raise RuntimeError("GraphTokenizer must be fit on training graphs before encoding.")
+        if getattr(self, "original_token_ids", None) is None:
+            raise RuntimeError(
+                "GraphTokenizer lacks training original token ids; re-fit or rebuild it before encoding.")
 
     def __call__(self, data: Any):
         encoding = self.encode_graph(data)

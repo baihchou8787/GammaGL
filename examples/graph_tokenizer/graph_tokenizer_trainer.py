@@ -40,7 +40,7 @@ DATASETS = (
 )
 
 DEFAULT_SEEDS = (42, 43, 44, 45, 46)
-PREPROCESSING_CACHE_VERSION = 1
+PREPROCESSING_CACHE_VERSION = 2
 
 
 # GammaGL presets derived from the pinned official GraphTokenizer implementation.

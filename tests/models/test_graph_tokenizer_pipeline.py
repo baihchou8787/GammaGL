@@ -279,6 +279,35 @@ def test_preprocessing_cache_reuses_fitted_tokenizer_and_encoded_splits(
     assert len(list((tmp_path / "cache").glob("*.pickle"))) == 1
 
 
+def test_preprocessing_cache_does_not_reuse_records_from_the_previous_schema(
+        trainer, tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        dataset="qm9", encoder="bert", data_root=str(tmp_path / "data"),
+        preprocessing_cache_dir=str(tmp_path / "cache"), bpe_merges=2,
+        bpe_min_frequency=2, bpe_backend="python", num_serializations=1,
+        max_length=64)
+    spec = trainer.resolve_dataset("qm9")
+    splits = {"train": _qm9_graphs(trainer, 3),
+              "val": _qm9_graphs(trainer, 1, offset=3),
+              "test": _qm9_graphs(trainer, 1, offset=4)}
+    current_cache_version = trainer.PREPROCESSING_CACHE_VERSION
+    assert current_cache_version > 1
+    monkeypatch.setattr(trainer, "PREPROCESSING_CACHE_VERSION", 1)
+    stale_path = trainer.preprocessing_cache_path(args, spec)
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    with stale_path.open("wb") as handle:
+        pickle.dump({"tokenizer": "stale", "encoded": "stale",
+                     "normalizer": "stale", "output_dim": "stale"}, handle)
+    monkeypatch.setattr(trainer, "PREPROCESSING_CACHE_VERSION", current_cache_version)
+    monkeypatch.setattr(trainer, "load_dataset_splits", lambda *_: splits)
+
+    tokenizer, encoded, _, _ = trainer.load_or_prepare_preprocessing(args, spec)
+
+    assert tokenizer != "stale"
+    assert encoded != "stale"
+    assert trainer.preprocessing_cache_path(args, spec) != stale_path
+
+
 def test_warmup_cosine_scheduler_warms_up_then_decays(trainer):
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
