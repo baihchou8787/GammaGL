@@ -1,3 +1,12 @@
+| 数据集            | 编码器 | 指标           | 论文报告性能 | 本算法复现性能（最新实验） |
+| :---------------- | :----- | :------------- | -----------: | ------------------------: |
+| QM9               | BERT   | 原始尺度 MAE   |        0.122 |       0.11724 ± 0.00063 |
+| QM9               | GTE    | 原始尺度 MAE   |        0.071 |                           |
+| OGBG-molhiv       | BERT   | ROC-AUC        |        82.6% |      71.56310% ± 1.31374% |
+| OGBG-molhiv       | GTE    | ROC-AUC        |        87.4% |      72.15609% ± 1.59006% |
+| Peptides-struct   | BERT   | 平均 MAE       |        0.247 |                           |
+| Peptides-struct   | GTE    | 平均 MAE       |        0.242 |                           |
+
 # GraphTokenizer 训练
 
 `graph_tokenizer_trainer.py` 是唯一的正式训练入口。它使用 GammaGL 的
@@ -187,8 +196,8 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
 - MolHIV 将两个 logits 转为正类概率，对每个图的序列化概率取平均，然后报告 ROC-AUC。
 - Peptides-struct 对全部 11 个目标做逆变换，并报告各目标 MAE 的均值。
 
-GammaGL 结果：**pending / 尚未重新运行**。此次 streamlined trainer 重构后，历史 benchmark
-输出仅保存在本地，不能声称是由此入口产生的结果。
+复现结果以本文首行表格为准：仅填入已完成五个种子的最新正式实验汇总；未完成的数据集保持为空。
+MOLHIV + GTE 使用登记的 `batch_size=8` 显存恢复补测结果。
 
 ## 极小 smoke 测试
 
