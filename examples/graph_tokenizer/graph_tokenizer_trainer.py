@@ -27,16 +27,29 @@ from typing import Any, Dict, Iterable, List, Sequence
 class DatasetSpec:
     name: str
     aliases: tuple[str, ...]
+    dataset_class: str
+    storage_name: str
     task_type: str
     label_width: int
+    num_classes: int
+    metric: str
+    higher_is_better: bool
+    label_names: tuple[str, ...]
+
+    @property
+    def output_dim(self) -> int:
+        return self.num_classes or self.label_width
 
 
 DATASETS = (
-    DatasetSpec("qm9", ("qm9",), "regression", 16),
-    DatasetSpec("molhiv", ("molhiv", "ogbg-molhiv", "ogbg_molhiv"),
-                "binary_classification", 1),
-    DatasetSpec("peptides-struct", ("peptides-struct", "peptides_struct", "p-struct"),
-                "multi_target_regression", 11),
+    DatasetSpec("mutagenicity", ("mutagenicity", "mutag", "muta"),
+                "Mutagenicity", "mutagenicity", "binary_classification", 1, 2,
+                "Accuracy", True, ("label",)),
+    DatasetSpec("dblp", ("dblp", "dblp-v1", "dblp_v1"),
+                "GraphTokenizerDBLP", "dblp", "binary_classification", 1, 2,
+                "Accuracy", True, ("label",)),
+    DatasetSpec("aqsol", ("aqsol",), "AQSOL", "aqsol", "regression", 1, 0,
+                "MAE", False, ("solubility",)),
 )
 
 DEFAULT_SEEDS = (42, 43, 44, 45, 46)
@@ -47,7 +60,8 @@ PREPROCESSING_CACHE_VERSION = 2
 # CLI values override every item below.  ``max_length`` is the final input
 # limit, distinct from the model's ``max_position_embeddings`` capacity.
 _BASE_CONFIG = {
-    "batch_size": 32,
+    "pretrain_batch_size": 32,
+    "finetune_batch_size": 32,
     "learning_rate": 1e-5,
     "pretrain_learning_rate": 1e-4,
     "pretrain_epochs": 200,
@@ -59,7 +73,8 @@ _BASE_CONFIG = {
     "num_serializations": 100,
     "early_stopping_patience": 20,
     "mask_probability": 0.09,
-    "weight_decay": 0.1,
+    "pretrain_weight_decay": 0.1,
+    "finetune_weight_decay": 0.1,
     "pretrain_warmup_ratio": 0.12,
     "finetune_warmup_ratio": 0.025,
     "pretrain_max_grad_norm": 2.0,
@@ -78,17 +93,20 @@ _BASE_CONFIG = {
     "pooling": "mean",
 }
 PAPER_CONFIGS = {
-    ("qm9", "bert"): {**_BASE_CONFIG},
-    ("qm9", "gte"): {**_BASE_CONFIG, "pretrain_learning_rate": 5e-5,
-                        "max_length": 8096, "max_position_embeddings": 8192},
-    ("molhiv", "bert"): {**_BASE_CONFIG, "learning_rate": 5e-5},
-    ("molhiv", "gte"): {**_BASE_CONFIG, "pretrain_learning_rate": 5e-5,
-                           "learning_rate": 5e-5, "batch_size": 8, "max_length": 8096,
-                           "max_position_embeddings": 8192},
-    ("peptides-struct", "bert"): {**_BASE_CONFIG, "batch_size": 16},
-    ("peptides-struct", "gte"): {**_BASE_CONFIG, "batch_size": 4,
-                                    "gradient_accumulation_steps": 4,
-                                    "max_length": 8096, "max_position_embeddings": 8192},
+    ("mutagenicity", "bert"): {**_BASE_CONFIG},
+    ("mutagenicity", "gte"): {
+        **_BASE_CONFIG, "finetune_batch_size": 64, "learning_rate": 5e-5,
+        "finetune_epochs": 100, "finetune_weight_decay": 0.01,
+        "early_stopping_patience": 10, "max_position_embeddings": 8192,
+    },
+    ("dblp", "bert"): {**_BASE_CONFIG},
+    ("dblp", "gte"): {
+        **_BASE_CONFIG, "finetune_batch_size": 64, "learning_rate": 5e-5,
+        "finetune_epochs": 100, "finetune_weight_decay": 0.01,
+        "early_stopping_patience": 10, "max_position_embeddings": 8192,
+    },
+    ("aqsol", "bert"): {**_BASE_CONFIG},
+    ("aqsol", "gte"): {**_BASE_CONFIG, "max_position_embeddings": 8192},
 }
 
 
@@ -113,7 +131,8 @@ def resolve_dataset(name: str) -> DatasetSpec:
     for spec in DATASETS:
         if normalized in {item.replace("_", "-") for item in spec.aliases}:
             return spec
-    raise ValueError("dataset must be one of: qm9, molhiv, peptides-struct")
+    choices = ', '.join(spec.name for spec in DATASETS)
+    raise ValueError(f"dataset must be one of: {choices}")
 
 
 def ensure_torch_backend():
@@ -217,8 +236,7 @@ def graph_from_gammagl(graph, spec: DatasetSpec) -> GraphRecord:
         [[int(item) for item in edge_index[0]], [int(item) for item in edge_index[1]]],
         flatten_feature_ids(getattr(graph, "x", None)),
         flatten_feature_ids(getattr(graph, "edge_attr", None)),
-        graph_label(getattr(graph, "y", None), spec.label_width,
-                    allow_nan=spec.name == "peptides-struct"),
+        graph_label(getattr(graph, "y", None), spec.label_width, allow_nan=False),
     )
 
 
@@ -237,9 +255,8 @@ def load_dataset_splits(data_root: str, spec: DatasetSpec) -> Dict[str, List[Gra
     ensure_repo_on_path()
     from gammagl import datasets
 
-    classes = {"qm9": "QM9", "molhiv": "OGBGMolHIV", "peptides-struct": "PeptidesStruct"}
     try:
-        dataset = getattr(datasets, classes[spec.name])(root=str(data_root))
+        dataset = getattr(datasets, spec.dataset_class)(root=str(data_root))
     except FileNotFoundError as error:
         raise FileNotFoundError(
             "GraphTokenizer dataset is not prepared. Run:\n\n"
@@ -259,35 +276,26 @@ def prepare_data(data_root: str) -> None:
     from gammagl.datasets._graph_tokenizer_download import materialize_paper_dataset
 
     root = Path(data_root)
-    datasets = (
-        ("QM9", "qm9", ("qm9",)),
-        ("OGBG-MolHIV", "ogbg-molhiv", ("molhiv", "ogbg-molhiv", "ogbg_molhiv")),
-        ("Peptides-struct", "peptides-struct", ("peptides-struct", "peptides_struct", "p-struct")),
-    )
     print("GraphTokenizer data preparation")
     print(f"Cache: {(root / '.graph_tokenizer_release').resolve()}")
-    for label, name, aliases in datasets:
+    for spec in DATASETS:
         materialize_paper_dataset(
-            dataset_name=name,
-            aliases=aliases,
-            raw_dir=root / name / "raw",
+            dataset_name=spec.storage_name,
+            aliases=spec.aliases,
+            raw_dir=root / spec.storage_name / "raw",
             cache_root=root,
             allow_download=True,
         )
-        print(f"{label}: READY")
+        print(f"{spec.name}: READY")
     print("Checksum: PASS")
     print(f"Data root: {root.resolve()}")
 
 
 def synthetic_splits(spec: DatasetSpec) -> Dict[str, List[GraphRecord]]:
-    labels = []
-    for index in range(5):
-        if spec.name == "molhiv":
-            labels.append([float(index % 2)])
-        elif spec.name == "peptides-struct":
-            labels.append([float(index + column) / 10 for column in range(11)])
-        else:
-            labels.append([float(index + column) / 10 for column in range(16)])
+    if spec.num_classes:
+        labels = [[float(index % spec.num_classes)] for index in range(5)]
+    else:
+        labels = [[float(index) / 10] for index in range(5)]
     graphs = [
         GraphRecord([[0, 1], [1, 2]], [1, 2, 3], [1, 2], labels[0]),
         GraphRecord([[0, 1], [1, 2]], [2, 3, 4], [1, 3], labels[1]),
@@ -301,8 +309,7 @@ def synthetic_splits(spec: DatasetSpec) -> Dict[str, List[GraphRecord]]:
 def preprocessing_cache_path(args, spec: DatasetSpec) -> Path:
     cache_root = Path(getattr(args, "preprocessing_cache_dir", None)
                       or Path(args.data_root) / ".graph_tokenizer_preprocessing_cache")
-    raw_name = "ogbg-molhiv" if spec.name == "molhiv" else spec.name
-    raw_dir = Path(args.data_root) / raw_name / "raw"
+    raw_dir = Path(args.data_root) / spec.storage_name / "raw"
     source_files = []
     if raw_dir.exists():
         for path in sorted(item for item in raw_dir.rglob("*") if item.is_file()):
@@ -410,20 +417,10 @@ def encode_splits(tokenizer, splits, args) -> Dict[str, List[Dict[str, Any]]]:
 
 
 def normalize_labels(encoded, spec: DatasetSpec):
-    if spec.name == "molhiv":
-        return None, 2
-    if spec.name == "qm9":
-        target = 2  # HOMO in QM9's canonical target order.
-        train_values = [record["labels"][target] for record in encoded["train"]]
-        names = ["homo"]
-    else:
-        target = None
-        train_values = [[record["labels"][column] for record in encoded["train"]
-                         if math.isfinite(record["labels"][column])]
-                        for column in range(11)]
-        names = [f"target_{column}" for column in range(11)]
-    if spec.name == "qm9":
-        train_values = [train_values]
+    if spec.num_classes:
+        return None, spec.output_dim
+    train_values = [[record["labels"][column] for record in encoded["train"]]
+                    for column in range(spec.label_width)]
     means, stds = [], []
     for values in train_values:
         if not values or not all(math.isfinite(value) for value in values):
@@ -433,12 +430,11 @@ def normalize_labels(encoded, spec: DatasetSpec):
         stds.append(max(math.sqrt(sum((value - mean) ** 2 for value in values) / len(values)), 1e-12))
     for records in encoded.values():
         for record in records:
-            values = [record["labels"][target]] if target is not None else record["labels"]
             record["labels"] = [
-                ((value - means[index]) / stds[index] if math.isfinite(value) else float("nan"))
-                for index, value in enumerate(values)
+                (value - means[index]) / stds[index]
+                for index, value in enumerate(record["labels"])
             ]
-    return {"mean": means, "std": stds, "targets": names}, len(means)
+    return {"mean": means, "std": stds, "targets": list(spec.label_names)}, spec.output_dim
 
 
 def group_records(records: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -645,14 +641,9 @@ def supervised_logits(torch, model, input_ids, attention, noise_probability, noi
 
 
 def supervised_loss(torch, logits, labels, spec: DatasetSpec):
-    if spec.name == "molhiv":
-        valid = torch.isfinite(labels.reshape(-1))
-        return torch.nn.functional.cross_entropy(logits[valid], labels.reshape(-1)[valid].long())
-    valid = torch.isfinite(labels)
-    if not valid.any():
-        raise ValueError("Regression batch has no finite labels.")
-    return (torch.nn.functional.l1_loss if spec.name == "peptides-struct" else torch.nn.functional.mse_loss)(
-        logits[valid], labels[valid])
+    if spec.num_classes:
+        return torch.nn.functional.cross_entropy(logits, labels.reshape(-1).long())
+    return torch.nn.functional.mse_loss(logits, labels)
 
 
 def save_checkpoint(torch, path: Path, model, epoch: int, score: float) -> None:
@@ -713,8 +704,9 @@ def train_mlm_epoch(torch, model, loader, optimizer, scheduler, tokenizer, args,
 
 
 def run_mlm(torch, model, train_loader, tokenizer, args, device):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.pretrain_learning_rate,
-                                  weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.pretrain_learning_rate,
+        weight_decay=getattr(args, "pretrain_weight_decay", getattr(args, "weight_decay", 0.0)))
     scheduler = build_warmup_cosine_scheduler(
         torch, optimizer, total_steps=optimizer_steps_per_epoch(train_loader, args) * args.pretrain_epochs,
         warmup_ratio=args.pretrain_warmup_ratio)
@@ -726,23 +718,6 @@ def run_mlm(torch, model, train_loader, tokenizer, args, device):
         emit_event("epoch", phase="pretrain", epoch=epoch, train_loss=train_loss)
     return {"epochs_completed": len(history), "final_loss": history[-1]["train_loss"],
             "history": history}
-
-
-def roc_auc(labels: Sequence[float], scores: Sequence[float]) -> float:
-    positives = sum(label == 1 for label in labels)
-    negatives = sum(label == 0 for label in labels)
-    if not positives or not negatives:
-        return float("nan")
-    ranked = sorted(enumerate(scores), key=lambda item: item[1])
-    rank_sum, index = 0.0, 0
-    while index < len(ranked):
-        end = index + 1
-        while end < len(ranked) and ranked[end][1] == ranked[index][1]:
-            end += 1
-        average_rank = (index + 1 + end) / 2
-        rank_sum += average_rank * sum(labels[ranked[item][0]] == 1 for item in range(index, end))
-        index = end
-    return (rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
 
 
 def denormalize(torch, values, normalizer):
@@ -763,22 +738,18 @@ def evaluate_downstream(torch, model, loader, spec, normalizer, device):
             loss = supervised_loss(torch, logits, labels, spec)
             total_loss += float(loss) * len(input_ids)
             count += len(input_ids)
-            predictions = torch.softmax(logits, -1)[:, 1:2] if spec.name == "molhiv" else logits
-            for graph_id, label, prediction in zip(graph_ids.tolist(), labels.cpu(), predictions.cpu()):
+            for graph_id, label, prediction in zip(graph_ids.tolist(), labels.cpu(), logits.cpu()):
                 grouped.setdefault(graph_id, {"label": label, "predictions": []})["predictions"].append(prediction)
     labels = torch.stack([item["label"] for item in grouped.values()])
     predictions = torch.stack([torch.stack(item["predictions"]).mean(0) for item in grouped.values()])
-    raw_labels, raw_predictions = denormalize(torch, labels, normalizer), denormalize(torch, predictions, normalizer)
-    if spec.name == "molhiv":
-        metric = roc_auc(labels.reshape(-1).tolist(), predictions.reshape(-1).tolist())
-        detail = {"rocauc": metric, "metric_space": "positive_class_probability"}
-    elif spec.name == "qm9":
-        metric = float(torch.abs(raw_labels - raw_predictions).mean())
-        detail = {"homo_mae": metric, "metric_space": "raw_label"}
+    if spec.num_classes:
+        metric = float((predictions.argmax(dim=-1) == labels.reshape(-1).long()).float().mean())
+        detail = {spec.metric.lower(): metric, "metric_space": "class_label"}
     else:
-        per_target = torch.nanmean(torch.abs(raw_labels - raw_predictions), dim=0)
-        metric = float(per_target.mean())
-        detail = {"average_mae": metric, "per_target_mae": per_target.tolist(), "metric_space": "raw_label"}
+        raw_labels = denormalize(torch, labels, normalizer)
+        raw_predictions = denormalize(torch, predictions, normalizer)
+        metric = float(torch.abs(raw_labels - raw_predictions).mean())
+        detail = {spec.metric.lower(): metric, "metric_space": "raw_label"}
     return {"loss": total_loss / max(count, 1), "metric": metric,
             "num_graphs": len(grouped), **detail}
 
@@ -810,12 +781,14 @@ def train_downstream_epoch(torch, model, loader, optimizer, scheduler, spec, arg
 
 
 def run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, normalizer, args, device, checkpoint):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate,
+        weight_decay=getattr(args, "finetune_weight_decay", getattr(args, "weight_decay", 0.0)))
     scheduler = build_warmup_cosine_scheduler(
         torch, optimizer, total_steps=optimizer_steps_per_epoch(train_loader, args) * args.finetune_epochs,
         warmup_ratio=args.finetune_warmup_ratio)
     best, stale, history = None, 0, []
-    higher_is_better = spec.name == "molhiv"
+    higher_is_better = spec.higher_is_better
     for epoch in range(1, args.finetune_epochs + 1):
         train_loss = train_downstream_epoch(
             torch, model, train_loader, optimizer, scheduler, spec, args, device, args.seed + epoch)
@@ -842,9 +815,16 @@ def run_finetuning(torch, model, train_loader, val_loader, test_loader, spec, no
 def apply_preset(args, config=None):
     if config is None:
         config = PAPER_CONFIGS[(resolve_dataset(args.dataset).name, args.encoder)]
+    pretrain_batch_size = args.pretrain_batch_size
+    finetune_batch_size = args.finetune_batch_size
     for name, value in config.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
+    if args.batch_size is not None:
+        if pretrain_batch_size is None:
+            args.pretrain_batch_size = args.batch_size
+        if finetune_batch_size is None:
+            args.finetune_batch_size = args.batch_size
     if args.max_length > args.max_position_embeddings:
         raise ValueError(
             "max_length must not exceed max_position_embeddings.")
@@ -853,11 +833,7 @@ def apply_preset(args, config=None):
 
 
 def metric_name_for_dataset(spec):
-    if spec.name == "molhiv":
-        return "ROC-AUC"
-    if spec.name == "peptides-struct":
-        return "Average MAE"
-    return "MAE"
+    return spec.metric
 
 
 def run_output_directory(args, spec, run_index, seed):
@@ -885,19 +861,18 @@ def run_single_experiment(args, config, seed, run_index=0):
     tokenizer.validate_model_vocab(tokenizer.max_token_id + 1)
     device = torch.device(args.device)
     model = make_model(args, tokenizer.max_token_id + 1, tokenizer.special_tokens.pad_token_id, output_dim).to(device)
-    loader_args = {"torch": torch, "batch_size": args.batch_size,
-                   "pad_token_id": tokenizer.special_tokens.pad_token_id}
+    loader_args = {"torch": torch, "pad_token_id": tokenizer.special_tokens.pad_token_id}
     pretrain_loader = make_loader(
-        **loader_args, records=encoded["train"], shuffle=True, choose_variant=True,
+        **loader_args, batch_size=args.pretrain_batch_size, records=encoded["train"], shuffle=True, choose_variant=True,
         tokenizer=tokenizer, augmentation=augmentation_config(args, "pretrain"),
         max_length=args.max_length, seed=args.seed)
     train_loader = make_loader(
-        **loader_args, records=encoded["train"], shuffle=True, choose_variant=True,
+        **loader_args, batch_size=args.finetune_batch_size, records=encoded["train"], shuffle=True, choose_variant=True,
         tokenizer=tokenizer, augmentation=augmentation_config(args, "finetune"),
         max_length=args.max_length, seed=args.seed + 1)
-    val_loader = make_loader(**loader_args, records=encoded["val"],
+    val_loader = make_loader(**loader_args, batch_size=args.finetune_batch_size, records=encoded["val"],
                              shuffle=False, choose_variant=False)
-    test_loader = make_loader(**loader_args, records=encoded["test"],
+    test_loader = make_loader(**loader_args, batch_size=args.finetune_batch_size, records=encoded["test"],
                               shuffle=False, choose_variant=False)
     directory = run_output_directory(args, spec, run_index, args.seed)
     mlm = run_mlm(torch, model, pretrain_loader, tokenizer, args, device)
@@ -930,12 +905,14 @@ def aggregate_run_results(results):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Train GraphTokenizer with validation-selected checkpoints.")
-    parser.add_argument("--dataset", default="qm9")
+    parser.add_argument("--dataset", default="mutagenicity")
     parser.add_argument("--encoder", "--model", dest="encoder", choices=("bert", "gte"), default="bert")
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--output-dir", default="runs/graph_tokenizer")
     parser.add_argument("--device", default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--pretrain-batch-size", type=int)
+    parser.add_argument("--finetune-batch-size", type=int)
     parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float)
     parser.add_argument("--pretrain-learning-rate", "--pretrain-lr", dest="pretrain_learning_rate", type=float)
     parser.add_argument("--pretrain-epochs", "--pretrain-epoch", dest="pretrain_epochs", type=int)
@@ -949,7 +926,8 @@ def build_parser():
     parser.add_argument("--num-serializations", "--num-realizations", dest="num_serializations", type=int)
     parser.add_argument("--early-stopping-patience", "--patience", dest="early_stopping_patience", type=int)
     parser.add_argument("--mask-probability", "--mask-prob", dest="mask_probability", type=float)
-    parser.add_argument("--weight-decay", type=float)
+    parser.add_argument("--pretrain-weight-decay", type=float)
+    parser.add_argument("--finetune-weight-decay", type=float)
     parser.add_argument("--pretrain-warmup-ratio", type=float)
     parser.add_argument("--finetune-warmup-ratio", type=float)
     parser.add_argument("--pretrain-max-grad-norm", type=float)
@@ -992,8 +970,14 @@ def main(argv=None):
     if args.prepare_data:
         prepare_data(args.data_root)
         return None
+    if args.smoke and args.encoder == "gte" and not args.allow_random_gte_init:
+        raise ValueError(
+            "GTE tiny smoke architecture is incompatible with the pretrained GTE checkpoint. "
+            "For a development-only tiny pipeline smoke, explicitly pass "
+            "--allow-random-gte-init; it is not a reproduced result.")
     if args.smoke:
-        smoke_overrides = {"batch_size": 2, "pretrain_epochs": 2, "finetune_epochs": 2,
+        smoke_overrides = {"batch_size": 2, "pretrain_batch_size": 2,
+                           "finetune_batch_size": 2, "pretrain_epochs": 2, "finetune_epochs": 2,
                            "max_length": 32, "max_position_embeddings": 32,
                            "bpe_merges": 8, "num_serializations": 1,
                            "early_stopping_patience": 1,

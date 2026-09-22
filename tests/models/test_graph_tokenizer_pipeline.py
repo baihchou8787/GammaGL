@@ -27,10 +27,10 @@ def trainer():
     return module
 
 
-def _qm9_graphs(trainer, count, offset=0):
+def _aqsol_graphs(trainer, count, offset=0):
     return [trainer.GraphRecord(
         [[0, 1], [1, 2]], [index % 4 + 1, 2, 3], [1, 2],
-        [float(index + column) for column in range(16)])
+        [float(index)])
         for index in range(offset, offset + count)]
 
 
@@ -58,18 +58,28 @@ class FixedLengthTokenizer:
         return self.strict_tokenizer.validate_token_sequences(token_sequences, max_length)
 
 
+class FakeDGLGraph:
+    """Pickleable subset of the DGL graph API used by the release adapters."""
+
+    def __init__(self, src, dst, ndata, edata):
+        self._src = src
+        self._dst = dst
+        self.ndata = ndata
+        self.edata = edata
+
+    def edges(self):
+        return self._src, self._dst
+
+
 def _write_graph_tokenizer_bundle(path):
-    qm9_properties = {name: float(index) for index, name in enumerate(
-        ("mu", "alpha", "homo", "lumo", "gap", "r2", "zpve", "u0",
-         "u298", "h298", "g298", "cv", "u0_atom", "u298_atom",
-         "h298_atom", "g298_atom"))}
     datasets = {
-        "qm9": [{"edge_index": [[0], [1]], "x": [6, 8], "edge_attr": [1],
-                 "properties": qm9_properties}],
-        "ogbg-molhiv": [({"edges": [[0], [1]], "node_type_ids": [6, 8],
-                           "edge_type_ids": [1]}, [1])],
-        "peptides-struct": [({"edges": [[0], [1]], "node_token_ids": [[5], [9]],
-                               "edge_token_ids": [[2]]}, [float(index) for index in range(11)])],
+        # The official Mutagenicity and DBLP release loaders accept DGL graphs
+        # with node_token_ids and synthesize their documented zero edge token.
+        "mutagenicity": [(FakeDGLGraph([0], [1], {"node_token_ids": [[5], [9]]}, {}), 1)],
+        "dblp": [(FakeDGLGraph([0], [1], {"node_token_ids": [[7], [11]]}, {}), 0)],
+        # AQSOL uses DGL ndata/edata feat fields; both are mandatory and mapped
+        # by its adapter using the official atomic-number/bond-type token rules.
+        "aqsol": [(FakeDGLGraph([0], [1], {"feat": [6, 8]}, {"feat": [1]}), -2.75)],
     }
     with tarfile.open(path, "w:gz") as archive:
         for dataset_name, samples in datasets.items():
@@ -107,12 +117,15 @@ def test_prepare_data_mode_materializes_shared_bundle_and_training_reuses_it(
     root = tmp_path / "data"
 
     assert trainer.main(["--prepare-data", "--data-root", str(root)]) is None
-    first_bytes = (root / "qm9" / "raw" / "data.pkl").read_bytes()
-    assert "QM9: READY" in capsys.readouterr().out
+    first_bytes = (root / "aqsol" / "raw" / "data.pkl").read_bytes()
+    output = capsys.readouterr().out
+    assert "mutagenicity: READY" in output
+    assert "dblp: READY" in output
+    assert "aqsol: READY" in output
 
     assert trainer.main(["--prepare-data", "--data-root", str(root)]) is None
-    assert (root / "qm9" / "raw" / "data.pkl").read_bytes() == first_bytes
-    assert trainer.load_dataset_splits(str(root), trainer.resolve_dataset("qm9"))["train"]
+    assert (root / "aqsol" / "raw" / "data.pkl").read_bytes() == first_bytes
+    assert trainer.load_dataset_splits(str(root), trainer.resolve_dataset("aqsol"))["train"]
 
 
 def test_training_requires_prepared_data_without_network(trainer, tmp_path, monkeypatch):
@@ -121,20 +134,20 @@ def test_training_requires_prepared_data_without_network(trainer, tmp_path, monk
                         lambda *_args, **_kwargs: pytest.fail("training must not download the shared bundle"))
 
     with pytest.raises(FileNotFoundError, match="GraphTokenizer dataset is not prepared"):
-        trainer.load_dataset_splits(str(tmp_path / "empty"), trainer.resolve_dataset("qm9"))
+        trainer.load_dataset_splits(str(tmp_path / "empty"), trainer.resolve_dataset("aqsol"))
 
 
 @pytest.mark.parametrize("split_name", ("train", "val", "test"))
 def test_encode_splits_rejects_overlong_sequences_for_every_split(trainer, split_name):
-    args = SimpleNamespace(dataset="qm9", num_serializations=1, max_length=8)
+    args = SimpleNamespace(dataset="aqsol", num_serializations=1, max_length=8)
     tokenizer = FixedLengthTokenizer([3, 8, 9, 10, 11, 12, 13, 14, 4])
-    graph = SimpleNamespace(y=[0.0] * 16)
+    graph = SimpleNamespace(y=[0.0])
 
     with pytest.raises(ValueError) as error:
         trainer.encode_splits(tokenizer, {split_name: [graph]}, args)
 
     message = str(error.value)
-    assert "dataset=qm9" in message
+    assert "dataset=aqsol" in message
     assert f"split={split_name}" in message
     assert "sample=0" in message
     assert "length=9" in message
@@ -142,9 +155,9 @@ def test_encode_splits_rejects_overlong_sequences_for_every_split(trainer, split
 
 
 def test_encode_splits_allows_sequence_at_max_length(trainer):
-    args = SimpleNamespace(dataset="qm9", num_serializations=1, max_length=8)
+    args = SimpleNamespace(dataset="aqsol", num_serializations=1, max_length=8)
     tokenizer = FixedLengthTokenizer([3, 8, 9, 10, 11, 12, 13, 4])
-    graph = SimpleNamespace(y=[0.0] * 16)
+    graph = SimpleNamespace(y=[0.0])
 
     encoded = trainer.encode_splits(tokenizer, {"train": [graph]}, args)
 
@@ -152,10 +165,10 @@ def test_encode_splits_allows_sequence_at_max_length(trainer):
 
 
 @pytest.mark.parametrize("dataset,length", (
-    ("qm9", 768),
-    ("molhiv", 826),
-    ("peptides-struct", 1587),
-    ("qm9", 8096),
+    ("mutagenicity", 768),
+    ("dblp", 826),
+    ("aqsol", 1587),
+    ("aqsol", 8096),
 ))
 def test_bert_formal_presets_accept_sequences_up_to_8096(trainer, dataset, length):
     args = trainer.apply_preset(trainer.build_parser().parse_args([
@@ -173,7 +186,7 @@ def test_bert_formal_presets_accept_sequences_up_to_8096(trainer, dataset, lengt
 
 def test_bert_formal_preset_rejects_sequence_longer_than_8096(trainer):
     args = trainer.apply_preset(trainer.build_parser().parse_args([
-        "--dataset", "molhiv", "--encoder", "bert",
+        "--dataset", "mutagenicity", "--encoder", "bert",
     ]))
     tokenizer = FixedLengthTokenizer([3] + list(range(8, 8 + 8097 - 2)) + [4])
     graph = SimpleNamespace(y=[0.0])
@@ -184,7 +197,7 @@ def test_bert_formal_preset_rejects_sequence_longer_than_8096(trainer):
 
 def test_preset_rejects_a_sequence_limit_above_positional_capacity(trainer):
     args = trainer.build_parser().parse_args([
-        "--dataset", "qm9", "--encoder", "bert", "--max-length", "8097",
+        "--dataset", "aqsol", "--encoder", "bert", "--max-length", "8097",
     ])
 
     with pytest.raises(ValueError, match="max_length must not exceed max_position_embeddings"):
@@ -208,7 +221,7 @@ def test_trainer_collate_pads_to_the_longest_sequence_in_its_batch(trainer):
 
 def _run_result(seed, run_index, metric):
     return {
-        "dataset": "qm9",
+        "dataset": "aqsol",
         "encoder": "bert",
         "seed": seed,
         "run_index": run_index,
@@ -223,10 +236,10 @@ def test_default_seeds_are_five_explicit_runs(trainer):
 
 def test_paper_preset_uses_phase_specific_warmup_and_gradient_clipping(trainer):
     args = trainer.apply_preset(trainer.build_parser().parse_args([
-        "--dataset", "molhiv", "--encoder", "gte",
+        "--dataset", "mutagenicity", "--encoder", "gte",
     ]))
 
-    assert args.pretrain_learning_rate == 5e-5
+    assert args.pretrain_learning_rate == 1e-4
     assert args.learning_rate == 5e-5
     assert args.pretrain_epochs == 200
     assert args.mask_probability == 0.09
@@ -234,7 +247,8 @@ def test_paper_preset_uses_phase_specific_warmup_and_gradient_clipping(trainer):
     assert args.finetune_warmup_ratio == 0.025
     assert args.pretrain_max_grad_norm == 2.0
     assert args.finetune_max_grad_norm == 0.5
-    assert args.batch_size == 8
+    assert args.pretrain_batch_size == 32
+    assert args.finetune_batch_size == 64
     assert (args.pretrain_swap_probability, args.pretrain_swap_ratio,
             args.pretrain_swap_window) == (0.5, 0.10, 3)
     assert (args.finetune_swap_probability, args.finetune_swap_ratio,
@@ -243,26 +257,42 @@ def test_paper_preset_uses_phase_specific_warmup_and_gradient_clipping(trainer):
     assert (args.finetune_noise_probability, args.finetune_noise_std) == (0.3, 0.01)
 
 
-def test_peptides_struct_gte_preset_uses_memory_safe_micro_batches(trainer):
+@pytest.mark.parametrize(("argv", "expected"), [
+    ([], (32, 32)),
+    (["--batch-size", "7"], (7, 7)),
+    (["--batch-size", "8", "--finetune-batch-size", "4"], (8, 4)),
+    (["--batch-size", "8", "--pretrain-batch-size", "2"], (2, 8)),
+])
+def test_batch_size_overrides_presets_without_overriding_phase_specific_values(
+        trainer, argv, expected):
     args = trainer.apply_preset(trainer.build_parser().parse_args([
-        "--dataset", "peptides-struct", "--encoder", "gte",
+        "--dataset", "mutagenicity", "--encoder", "bert", *argv,
     ]))
 
-    assert args.batch_size == 4
-    assert args.gradient_accumulation_steps == 4
+    assert (args.pretrain_batch_size, args.finetune_batch_size) == expected
+
+
+def test_dblp_gte_preset_uses_its_official_finetune_batch_size(trainer):
+    args = trainer.apply_preset(trainer.build_parser().parse_args([
+        "--dataset", "dblp", "--encoder", "gte",
+    ]))
+
+    assert args.pretrain_batch_size == 32
+    assert args.finetune_batch_size == 64
+    assert args.gradient_accumulation_steps == 1
 
 
 def test_preprocessing_cache_reuses_fitted_tokenizer_and_encoded_splits(
         trainer, tmp_path, monkeypatch):
     args = SimpleNamespace(
-        dataset="qm9", encoder="bert", data_root=str(tmp_path / "data"),
+        dataset="aqsol", encoder="bert", data_root=str(tmp_path / "data"),
         preprocessing_cache_dir=str(tmp_path / "cache"), bpe_merges=2,
         bpe_min_frequency=2, bpe_backend="python", num_serializations=1,
         max_length=64)
-    spec = trainer.resolve_dataset("qm9")
-    splits = {"train": _qm9_graphs(trainer, 3),
-              "val": _qm9_graphs(trainer, 1, offset=3),
-              "test": _qm9_graphs(trainer, 1, offset=4)}
+    spec = trainer.resolve_dataset("aqsol")
+    splits = {"train": _aqsol_graphs(trainer, 3),
+              "val": _aqsol_graphs(trainer, 1, offset=3),
+              "test": _aqsol_graphs(trainer, 1, offset=4)}
     monkeypatch.setattr(trainer, "load_dataset_splits", lambda *_: splits)
 
     first_tokenizer, first_encoded, first_normalizer, first_output_dim = (
@@ -282,14 +312,14 @@ def test_preprocessing_cache_reuses_fitted_tokenizer_and_encoded_splits(
 def test_preprocessing_cache_does_not_reuse_records_from_the_previous_schema(
         trainer, tmp_path, monkeypatch):
     args = SimpleNamespace(
-        dataset="qm9", encoder="bert", data_root=str(tmp_path / "data"),
+        dataset="aqsol", encoder="bert", data_root=str(tmp_path / "data"),
         preprocessing_cache_dir=str(tmp_path / "cache"), bpe_merges=2,
         bpe_min_frequency=2, bpe_backend="python", num_serializations=1,
         max_length=64)
-    spec = trainer.resolve_dataset("qm9")
-    splits = {"train": _qm9_graphs(trainer, 3),
-              "val": _qm9_graphs(trainer, 1, offset=3),
-              "test": _qm9_graphs(trainer, 1, offset=4)}
+    spec = trainer.resolve_dataset("aqsol")
+    splits = {"train": _aqsol_graphs(trainer, 3),
+              "val": _aqsol_graphs(trainer, 1, offset=3),
+              "test": _aqsol_graphs(trainer, 1, offset=4)}
     current_cache_version = trainer.PREPROCESSING_CACHE_VERSION
     assert current_cache_version > 1
     monkeypatch.setattr(trainer, "PREPROCESSING_CACHE_VERSION", 1)
@@ -365,7 +395,7 @@ def test_phase_training_uses_phase_specific_gradient_clipping(trainer, monkeypat
     trainer.train_downstream_epoch(
         torch, supervised_model, loader,
         torch.optim.SGD(supervised_model.parameters(), lr=0.1), supervised_scheduler,
-        trainer.resolve_dataset("qm9"), SimpleNamespace(
+        trainer.resolve_dataset("aqsol"), SimpleNamespace(
             finetune_max_grad_norm=0.5, finetune_noise_probability=0.0,
             finetune_noise_std=0.01),
         torch.device("cpu"))
@@ -480,7 +510,7 @@ def _accumulated_gradients(trainer, monkeypatch, path, batch_gradients, accumula
         monkeypatch.setattr(trainer, "supervised_logits", known_logits)
         monkeypatch.setattr(trainer, "supervised_loss", lambda _torch, logits, *_args: logits.mean())
         epoch_loss = trainer.train_downstream_epoch(
-            torch, model, loader, optimizer, scheduler, trainer.resolve_dataset("qm9"),
+            torch, model, loader, optimizer, scheduler, trainer.resolve_dataset("aqsol"),
             SimpleNamespace(finetune_max_grad_norm=1e6, finetune_noise_probability=0.0,
                             finetune_noise_std=0.0,
                             gradient_accumulation_steps=accumulation_steps),
@@ -657,10 +687,10 @@ def test_main_runs_requested_single_experiment(trainer, monkeypatch, tmp_path):
 
     monkeypatch.setattr(trainer, "run_single_experiment", run_single)
 
-    summary = trainer.main(["--smoke", "--dataset", "qm9", "--encoder", "bert",
+    summary = trainer.main(["--smoke", "--dataset", "aqsol", "--encoder", "bert",
                             "--seeds", "42", "--output-dir", str(tmp_path)])
     assert len(calls) == 1
-    assert calls[0][1] == trainer.PAPER_CONFIGS[("qm9", "bert")]
+    assert calls[0][1] == trainer.PAPER_CONFIGS[("aqsol", "bert")]
     assert calls[0][2] == 42
     assert calls[0][3] == 0
     assert summary["seeds"] == [42]
@@ -677,13 +707,13 @@ def test_main_orchestrates_five_runs_and_isolates_summaries(trainer, monkeypatch
 
     monkeypatch.setattr(trainer, "run_single_experiment", run_single)
 
-    summary = trainer.main(["--dataset", "qm9", "--encoder", "bert",
+    summary = trainer.main(["--dataset", "aqsol", "--encoder", "bert",
                             "--output-dir", str(tmp_path)])
 
     assert calls == [(42, 0), (43, 1), (44, 2), (45, 3), (46, 4)]
     assert summary["run_metrics"] == [1.0, 2.0, 3.0, 4.0, 5.0]
     for seed, run_index in calls:
-        assert (tmp_path / "qm9" / "bert" /
+        assert (tmp_path / "aqsol" / "bert" /
                 f"run_{run_index + 1:02d}_seed_{seed}" / "summary.json").is_file()
 
 
@@ -720,10 +750,10 @@ def test_main_does_not_write_complete_summary_when_a_run_fails(trainer, monkeypa
     monkeypatch.setattr(trainer, "run_single_experiment", run_single)
 
     with pytest.raises(RuntimeError, match="run failed"):
-        trainer.main(["--dataset", "qm9", "--encoder", "bert", "--seeds", "42", "43", "44",
+        trainer.main(["--dataset", "aqsol", "--encoder", "bert", "--seeds", "42", "43", "44",
                       "--output-dir", str(tmp_path)])
 
-    partial = json.loads((tmp_path / "qm9" / "bert" / "summary.json").read_text())
+    partial = json.loads((tmp_path / "aqsol" / "bert" / "summary.json").read_text())
     assert partial["complete"] is False
     assert partial["run_metrics"] == [1.0, 2.0]
     assert "mean" not in partial
@@ -733,19 +763,19 @@ def test_main_does_not_write_complete_summary_when_a_run_fails(trainer, monkeypa
 
 def test_tiny_pipeline_runs_full_train_mlm_then_finetune_and_final_test(trainer, monkeypatch, tmp_path):
     splits = {
-        "train": _qm9_graphs(trainer, 8),
-        "val": _qm9_graphs(trainer, 4, 20),
-        "test": _qm9_graphs(trainer, 4, 40),
+        "train": _aqsol_graphs(trainer, 8),
+        "val": _aqsol_graphs(trainer, 4, 20),
+        "test": _aqsol_graphs(trainer, 4, 40),
     }
     monkeypatch.setattr(trainer, "synthetic_splits", lambda _spec: splits)
 
     summary = trainer.main([
-        "--smoke", "--dataset", "qm9", "--encoder", "bert", "--device", "cpu",
+        "--smoke", "--dataset", "aqsol", "--encoder", "bert", "--device", "cpu",
         "--seeds", "42",
         "--output-dir", str(tmp_path),
     ])
 
-    run_directory = tmp_path / "qm9" / "bert" / "run_01_seed_42"
+    run_directory = tmp_path / "aqsol" / "bert" / "run_01_seed_42"
     run_summary = json.loads((run_directory / "summary.json").read_text())
     assert Path(run_summary["checkpoints"]["finetune"]).is_file()
     assert run_summary["mlm"]["epochs_completed"] == 2
@@ -759,19 +789,19 @@ def test_tiny_pipeline_runs_full_train_mlm_then_finetune_and_final_test(trainer,
 
 def test_tiny_pipeline_writes_summary_file(trainer, tmp_path):
     summary = trainer.main([
-        "--smoke", "--dataset", "qm9", "--encoder", "bert", "--device", "cpu",
+        "--smoke", "--dataset", "aqsol", "--encoder", "bert", "--device", "cpu",
         "--seeds", "42",
         "--output-dir", str(tmp_path),
     ])
 
-    saved = tmp_path / "qm9" / "bert" / "summary.json"
+    saved = tmp_path / "aqsol" / "bert" / "summary.json"
     assert saved.is_file()
     assert saved.read_text() == json.dumps(summary, indent=2, allow_nan=True)
 
 
 def test_tiny_pipeline_emits_preprocessing_and_training_progress(trainer, tmp_path, capsys):
     trainer.main([
-        "--smoke", "--dataset", "qm9", "--encoder", "bert", "--device", "cpu",
+        "--smoke", "--dataset", "aqsol", "--encoder", "bert", "--device", "cpu",
         "--seeds", "42",
         "--output-dir", str(tmp_path),
     ])
@@ -784,10 +814,46 @@ def test_tiny_pipeline_emits_preprocessing_and_training_progress(trainer, tmp_pa
     assert any(event.get("phase") == "finetune" for event in events)
 
 
+def test_tiny_pretrained_gte_smoke_requires_explicit_random_initialization(trainer, tmp_path):
+    with pytest.raises(ValueError, match="tiny smoke architecture.*allow-random-gte-init"):
+        trainer.main([
+            "--smoke", "--dataset", "aqsol", "--encoder", "gte", "--device", "cpu",
+            "--seeds", "42", "--output-dir", str(tmp_path),
+        ])
+
+
+def test_tiny_random_gte_smoke_runs_only_when_explicitly_requested(trainer, tmp_path):
+    summary = trainer.main([
+        "--smoke", "--dataset", "aqsol", "--encoder", "gte", "--device", "cpu",
+        "--allow-random-gte-init", "--seeds", "42", "--output-dir", str(tmp_path),
+    ])
+
+    assert summary["encoder"] == "gte"
+    assert summary["complete"] is True
+
+
+def test_non_smoke_gte_does_not_require_random_initialization(trainer, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        trainer, "run_single_experiment",
+        lambda _args, _config, seed, run_index=0: {
+            "dataset": "aqsol", "encoder": "gte", "seed": seed,
+            "run_index": run_index, "metric_name": "MAE", "metric": 0.1,
+        },
+    )
+
+    summary = trainer.main([
+        "--dataset", "aqsol", "--encoder", "gte", "--seeds", "42",
+        "--output-dir", str(tmp_path),
+    ])
+
+    assert summary["encoder"] == "gte"
+    assert summary["complete"] is True
+
+
 def test_formal_gte_preset_uses_the_official_loader(trainer, monkeypatch):
     from gammagl.models.graph_gte import GraphGTE
 
-    args = trainer.build_parser().parse_args(["--dataset", "qm9", "--encoder", "gte"])
+    args = trainer.build_parser().parse_args(["--dataset", "aqsol", "--encoder", "gte"])
     args = trainer.apply_preset(args)
     calls, loaded = {}, SimpleNamespace(pretrained_manifest={
         "pretrained": True, "reproduction": True, "encoder_coverage": 1.0,
@@ -808,10 +874,10 @@ def test_formal_gte_preset_uses_the_official_loader(trainer, monkeypatch):
 
 def test_formal_gte_tokenizer_uses_the_official_padding_id(trainer):
     args = trainer.apply_preset(trainer.build_parser().parse_args([
-        "--dataset", "qm9", "--encoder", "gte",
+        "--dataset", "aqsol", "--encoder", "gte",
     ]))
 
-    tokenizer = trainer.make_tokenizer(args, _qm9_graphs(trainer, 2))
+    tokenizer = trainer.make_tokenizer(args, _aqsol_graphs(trainer, 2))
 
     assert tokenizer.special_tokens.pad_token_id == 1
     assert tokenizer.special_tokens.unk_token_id == 0
@@ -821,7 +887,7 @@ def test_formal_gte_loader_failure_is_not_replaced_with_random_initialization(tr
     from gammagl.models.graph_gte import GraphGTE
 
     args = trainer.apply_preset(trainer.build_parser().parse_args([
-        "--dataset", "qm9", "--encoder", "gte",
+        "--dataset", "aqsol", "--encoder", "gte",
     ]))
 
     def rejected_loader(_cls, **_kwargs):
@@ -837,7 +903,7 @@ def test_explicit_random_gte_development_mode_is_not_a_reproduction(trainer, mon
     from gammagl.models.graph_gte import GraphGTE
 
     args = trainer.apply_preset(trainer.build_parser().parse_args([
-        "--dataset", "qm9", "--encoder", "gte", "--allow-random-gte-init",
+        "--dataset", "aqsol", "--encoder", "gte", "--allow-random-gte-init",
         "--hidden-size", "16", "--num-hidden-layers", "1",
         "--num-attention-heads", "4", "--intermediate-size", "32",
     ]))
@@ -853,8 +919,8 @@ def test_explicit_random_gte_development_mode_is_not_a_reproduction(trainer, mon
 
 
 def test_train_only_bpe_and_normalization_do_not_use_validation_or_test(trainer):
-    train = _qm9_graphs(trainer, 2)
-    held_out = trainer.GraphRecord([[0], [1]], [101, 102], [5], [1000.0] * 16)
+    train = _aqsol_graphs(trainer, 2)
+    held_out = trainer.GraphRecord([[0], [1]], [101, 102], [5], [1000.0])
     args = SimpleNamespace(bpe_merges=2, bpe_min_frequency=2, bpe_backend="python",
                            num_serializations=1)
     tokenizer = trainer.make_tokenizer(args, train)
@@ -862,12 +928,11 @@ def test_train_only_bpe_and_normalization_do_not_use_validation_or_test(trainer)
 
     held_out_encoding = tokenizer.encode_graph(held_out)
     encoded = {
-        "train": [_record(0, [0.0, 0.0, 1.0] + [0.0] * 13),
-                  _record(1, [0.0, 0.0, 3.0] + [0.0] * 13)],
-        "val": [_record(0, [0.0, 0.0, 1000.0] + [0.0] * 13)],
-        "test": [_record(0, [0.0, 0.0, -1000.0] + [0.0] * 13)],
+        "train": [_record(0, [1.0]), _record(1, [3.0])],
+        "val": [_record(0, [1000.0])],
+        "test": [_record(0, [-1000.0])],
     }
-    normalizer, output_dim = trainer.normalize_labels(encoded, trainer.resolve_dataset("qm9"))
+    normalizer, output_dim = trainer.normalize_labels(encoded, trainer.resolve_dataset("aqsol"))
 
     assert tokenizer.special_tokens.unk_token_id in held_out_encoding.input_ids
     assert (tokenizer.vocabulary, tokenizer.bpe.codebook.merge_rules) == before
@@ -876,43 +941,41 @@ def test_train_only_bpe_and_normalization_do_not_use_validation_or_test(trainer)
     assert normalizer["std"] == [1.0]
 
 
-def test_qm9_metric_uses_homo_inverse_normalization_and_raw_mae(trainer):
-    normalizer = {"mean": [10.0], "std": [2.0], "targets": ["homo"]}
+def test_aqsol_metric_inverse_normalizes_and_uses_raw_mae(trainer):
+    normalizer = {"mean": [10.0], "std": [2.0]}
     loader = trainer.make_loader(torch, [_record(0, [0.0])], 1, 0, False, False)
 
     result = trainer.evaluate_downstream(
-        torch, FixedLogits([[1.0]]), loader, trainer.resolve_dataset("qm9"), normalizer,
+        torch, FixedLogits([[1.0]]), loader, trainer.resolve_dataset("aqsol"), normalizer,
         torch.device("cpu"))
 
     assert result["metric_space"] == "raw_label"
-    assert result["homo_mae"] == pytest.approx(2.0)
+    assert result["mae"] == pytest.approx(2.0)
 
 
-def test_molhiv_metric_averages_serializations_before_roc_auc(trainer):
-    probabilities = [0.1, 0.3, 0.7, 0.9]
-    logits = [[math.log(1 - probability), math.log(probability)] for probability in probabilities]
+def test_mutagenicity_metric_averages_serializations_before_accuracy(trainer):
+    logits = [[3.0, 1.0], [2.0, 0.0], [0.0, 2.0], [1.0, 4.0]]
     records = [_record(0, [0.0]), _record(0, [0.0]), _record(1, [1.0]), _record(1, [1.0])]
     loader = trainer.make_loader(torch, records, 4, 0, False, False)
 
     result = trainer.evaluate_downstream(
-        torch, FixedLogits(logits), loader, trainer.resolve_dataset("molhiv"), None,
+        torch, FixedLogits(logits), loader, trainer.resolve_dataset("mutagenicity"), None,
         torch.device("cpu"))
 
     assert result["num_graphs"] == 2
-    assert result["metric_space"] == "positive_class_probability"
-    assert result["rocauc"] == pytest.approx(1.0)
+    assert result["metric_space"] == "class_label"
+    assert result["accuracy"] == pytest.approx(1.0)
 
 
-def test_peptides_metric_inverse_transforms_each_target_before_averaging(trainer):
-    normalizer = {"mean": [10.0] * 11, "std": [2.0] * 11, "targets": ["x"] * 11}
-    loader = trainer.make_loader(torch, [_record(0, [0.0] * 11)], 1, 0, False, False)
+def test_dblp_metric_uses_class_logits_and_accuracy(trainer):
+    loader = trainer.make_loader(torch, [_record(0, [1.0])], 1, 0, False, False)
 
     result = trainer.evaluate_downstream(
-        torch, FixedLogits([[0.5] * 11]), loader,
-        trainer.resolve_dataset("peptides-struct"), normalizer, torch.device("cpu"))
+        torch, FixedLogits([[0.2, 0.8]]), loader,
+        trainer.resolve_dataset("dblp"), None, torch.device("cpu"))
 
-    assert result["average_mae"] == pytest.approx(1.0)
-    assert result["per_target_mae"] == pytest.approx([1.0] * 11)
+    assert result["accuracy"] == pytest.approx(1.0)
+    assert result["metric_space"] == "class_label"
 
 
 def test_mlm_runs_configured_epochs_without_validation_or_checkpoint_restore(trainer, monkeypatch):
@@ -943,9 +1006,9 @@ def test_mlm_runs_configured_epochs_without_validation_or_checkpoint_restore(tra
 
 def test_single_run_uses_every_downstream_training_graph_for_mlm(trainer, monkeypatch, tmp_path):
     splits = {
-        "train": _qm9_graphs(trainer, 4),
-        "val": _qm9_graphs(trainer, 2, 20),
-        "test": _qm9_graphs(trainer, 2, 40),
+        "train": _aqsol_graphs(trainer, 4),
+        "val": _aqsol_graphs(trainer, 2, 20),
+        "test": _aqsol_graphs(trainer, 2, 40),
     }
     observed = {}
     monkeypatch.setattr(trainer, "synthetic_splits", lambda _spec: splits)
@@ -963,7 +1026,7 @@ def test_single_run_uses_every_downstream_training_graph_for_mlm(trainer, monkey
                         "history": [], "test": {"metric": 0.1}})
 
     trainer.main([
-        "--smoke", "--dataset", "qm9", "--encoder", "bert", "--device", "cpu",
+        "--smoke", "--dataset", "aqsol", "--encoder", "bert", "--device", "cpu",
         "--seeds", "42", "--output-dir", str(tmp_path),
     ])
 
@@ -996,7 +1059,7 @@ def test_finetune_early_stopping_restores_best_before_test(trainer, monkeypatch,
         lambda _torch, _optimizer, total_steps, warmup_ratio:
         scheduler_arguments.append((total_steps, warmup_ratio)) or object())
     result = trainer.run_finetuning(
-        torch, model, [None], None, None, trainer.resolve_dataset("qm9"), None, args,
+        torch, model, [None], None, None, trainer.resolve_dataset("aqsol"), None, args,
         torch.device("cpu"), tmp_path / "finetune.pt")
 
     assert result["best_epoch"] == 2

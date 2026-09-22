@@ -16,7 +16,7 @@ from gammagl.data.makedirs import makedirs
 from ._graph_tokenizer_download import materialize_paper_dataset
 
 
-def validate_molecular_splits(num_samples: int, split_indices: Dict[str, List[int]]) -> None:
+def validate_graph_tokenizer_splits(num_samples: int, split_indices: Dict[str, List[int]]) -> None:
     required = ('train', 'val', 'test')
     if set(split_indices) != set(required):
         raise ValueError(f"Split files must define exactly {required}.")
@@ -33,8 +33,8 @@ def validate_molecular_splits(num_samples: int, split_indices: Dict[str, List[in
             seen[index] = split
 
 
-class PreprocessedMolecularBenchmark(InMemoryDataset):
-    r"""Base class for molecular benchmark datasets stored as preprocessed
+class PreprocessedGraphBenchmark(InMemoryDataset):
+    r"""Base class for GraphTokenizer benchmark datasets stored as preprocessed
     graph pickle files plus train/validation/test split indices.
 
     The expected raw layout is:
@@ -56,6 +56,8 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
     task_type: str = ""
     label_keys: Tuple[str, ...] = ()
     allow_nan_labels: bool = False
+    num_classes: int = 0
+    default_edge_token: Optional[int] = None
     node_feature_columns: Dict[str, int] = {}
     edge_feature_columns: Dict[str, int] = {}
 
@@ -129,7 +131,7 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
 
         raw_samples = self._read_pickle(data_file)
         split_indices = self._read_split_indices()
-        validate_molecular_splits(len(raw_samples), split_indices)
+        validate_graph_tokenizer_splits(len(raw_samples), split_indices)
         data_list = [
             self._sample_to_graph(sample, index)
             for index, sample in enumerate(raw_samples)
@@ -160,7 +162,7 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
         with open(self.processed_paths[1], 'r', encoding='utf-8') as f:
             split_indices = {key: [int(index) for index in value]
                              for key, value in json.load(f).items()}
-        validate_molecular_splits(len(self), split_indices)
+        validate_graph_tokenizer_splits(len(self), split_indices)
         return split_indices
 
     def _read_pickle(self, path: str):
@@ -188,7 +190,9 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
             label_data = getattr(sample, 'y', None)
         elif isinstance(sample, dict):
             graph = self._graph_from_mapping(sample)
-            label_data = sample.get('properties', sample.get('y', sample.get('label', sample.get('labels'))))
+            label_data = sample.get(
+                'properties', sample.get(
+                    'y', sample.get('label', sample.get('labels', sample.get('solubility')))))
         elif isinstance(sample, tuple) and len(sample) >= 2:
             graph = self._graph_from_mapping(sample[0])
             label_data = sample[1]
@@ -206,16 +210,18 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
             node_data = getattr(graph_data, 'ndata', {})
             edge_data = getattr(graph_data, 'edata', {})
             node_name, node_values = self._first_present(
-                node_data, ('node_token_ids', 'x', 'attr'))
+                node_data,
+                ('node_token_ids', 'node_type_ids', 'x', 'node_features', 'node_feat',
+                 'attr', 'node_labels', 'feat'))
             edge_name, edge_values = self._first_present(
-                edge_data, ('edge_token_ids', 'edge_attr'))
-            graph_data = {
-                'edge_index': [self._to_list(src), self._to_list(dst)],
-                node_name: node_values,
-                edge_name: edge_values,
-            }
-            graph_data = {key: value for key, value in graph_data.items()
-                          if key is not None and value is not None}
+                edge_data,
+                ('edge_token_ids', 'edge_type_ids', 'edge_attr', 'edge_features',
+                 'edge_feat', 'edge_labels', 'edge_label', 'feat'))
+            graph_data = {'edge_index': [self._to_list(src), self._to_list(dst)]}
+            if node_values is not None:
+                graph_data['node_token_ids' if node_name.endswith('_token_ids') else 'x'] = node_values
+            if edge_values is not None:
+                graph_data['edge_token_ids' if edge_name.endswith('_token_ids') else 'edge_attr'] = edge_values
         if not isinstance(graph_data, dict):
             raise ValueError(f"Unsupported graph object: {type(graph_data)!r}")
 
@@ -226,20 +232,24 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
         x_name, x = self._first_present(
             graph_data,
             ('node_token_ids', 'node_type_ids', 'x', 'node_features', 'node_feat',
-             'attr', 'node_labels'))
+             'attr', 'node_labels', 'feat'))
         edge_name, edge_attr = self._first_present(
             graph_data,
             ('edge_token_ids', 'edge_type_ids', 'edge_attr', 'edge_features',
-             'edge_feat', 'edge_labels'))
+             'edge_feat', 'edge_labels', 'edge_label', 'feat'))
         if x is None:
             raise ValueError("Graph is missing paper-required node features.")
+        normalized_edge_index = self._normalize_edge_index(edge_index)
         if edge_attr is None:
-            raise ValueError("Graph is missing paper-required edge features.")
+            if self.default_edge_token is None:
+                raise ValueError("Graph is missing paper-required edge features.")
+            edge_name = 'default_edge_token'
+            edge_attr = [self.default_edge_token] * len(normalized_edge_index[0])
 
         return Graph(
             x=tlx.convert_to_tensor(
                 self._encode_feature_ids(x_name, x, is_edge=False), dtype=tlx.int64),
-            edge_index=tlx.convert_to_tensor(self._normalize_edge_index(edge_index), dtype=tlx.int64),
+            edge_index=tlx.convert_to_tensor(normalized_edge_index, dtype=tlx.int64),
             edge_attr=tlx.convert_to_tensor(
                 self._encode_feature_ids(edge_name, edge_attr, is_edge=True), dtype=tlx.int64),
             y=None,
@@ -253,10 +263,6 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
                 return self._as_float_list(label_data['labels'])
             missing = [key for key in self.label_keys if key not in label_data]
             if missing:
-                if self.name == 'qm9':
-                    raise ValueError(
-                        "QM9 sample must provide exactly 16 QM9 properties; "
-                        f"missing: {', '.join(missing)}.")
                 raise ValueError(f"Label mapping is missing required fields: {', '.join(missing)}.")
             return self._as_float_list([label_data[key] for key in self.label_keys])
         return self._as_float_list(label_data)
@@ -274,6 +280,18 @@ class PreprocessedMolecularBenchmark(InMemoryDataset):
                 f"{self.display_name} labels must have exactly {self.num_tasks} values; "
                 f"received {len(values)}.")
         result = [float(item) for item in values]
+        if self.num_classes:
+            for label in result:
+                if not math.isfinite(label):
+                    raise ValueError(
+                        f"{self.display_name} classification label {label!r} must be finite.")
+                if not label.is_integer():
+                    raise ValueError(
+                        f"{self.display_name} classification label {label!r} must be an integer.")
+                if not 0 <= label < self.num_classes:
+                    raise ValueError(
+                        f"{self.display_name} classification label {label!r} must be in "
+                        f"[0, {self.num_classes}).")
         if not self.allow_nan_labels and any(math.isnan(item) for item in result):
             raise ValueError(f"{self.display_name} labels cannot contain NaN values.")
         return result
