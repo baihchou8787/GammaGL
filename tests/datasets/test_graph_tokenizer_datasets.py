@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pickle
 import shutil
 import tarfile
@@ -12,6 +13,7 @@ import tensorlayerx as tlx
 
 import gammagl.datasets._graph_tokenizer_download as graph_tokenizer_download
 from gammagl.datasets import AQSOL, GraphTokenizerDBLP, Mutagenicity
+from gammagl.transforms.graph_serializer import FrequencyGuidedEulerianSerializer
 
 
 class FakeDGLGraph:
@@ -139,6 +141,16 @@ def test_aqsol_preserves_finite_float_labels(tmp_path, label):
     assert float(tlx.convert_to_numpy(graph.y)[0, 0]) == pytest.approx(label)
 
 
+@pytest.mark.parametrize("label", [float("nan"), float("inf"), float("-inf")])
+def test_aqsol_rejects_non_finite_labels(tmp_path, label):
+    _write_raw(tmp_path, "aqsol", [
+        (_graph({"feat": [6, 8]}, {"feat": [1]}), label),
+    ], {"train": [0], "val": [], "test": []})
+
+    with pytest.raises(ValueError, match="AQSOL.*finite"):
+        AQSOL(root=str(tmp_path))
+
+
 def test_aqsol_converts_feat_tokens_and_solubility_label(tmp_path):
     _write_raw(tmp_path, "aqsol", [
         (_graph({"feat": [6, 8]}, {"feat": [1]}), -2.5),
@@ -237,3 +249,58 @@ def test_missing_or_corrupted_bundle_fails_without_network(tmp_path, monkeypatch
     monkeypatch.setattr(module, "PAPER_DATA_BUNDLE_SHA256", hashlib.sha256(b"expected").hexdigest())
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
         module._verify_official_bundle(archive, remove_on_failure=False)
+
+
+def test_real_release_bundle_smoke_is_opt_in_and_never_downloads(tmp_path):
+    """Validate the actual release bundle only when a local bundle is configured."""
+    bundle = os.environ.get(graph_tokenizer_download.DATA_BUNDLE_ENV)
+    if not bundle:
+        pytest.skip(
+            "real release bundle not configured "
+            f"(set {graph_tokenizer_download.DATA_BUNDLE_ENV})")
+    bundle_path = Path(bundle).expanduser()
+    if not bundle_path.exists():
+        raise FileNotFoundError(
+            f"Configured real release bundle does not exist: {bundle_path}")
+
+    root = tmp_path / "real_release"
+    expectations = (
+        (Mutagenicity, "mutagenicity", 2, "binary_classification"),
+        (GraphTokenizerDBLP, "dblp", 2, "binary_classification"),
+        (AQSOL, "aqsol", 0, "regression"),
+    )
+    serializer = FrequencyGuidedEulerianSerializer()
+
+    for dataset_class, name, num_classes, task_type in expectations:
+        raw_dir = root / name / "raw"
+        graph_tokenizer_download.materialize_paper_dataset(
+            dataset_class.name, dataset_class.aliases, raw_dir, root,
+            allow_download=False)
+        dataset = dataset_class(root=str(root))
+        splits = dataset.get_idx_split()
+
+        assert set(splits) == {"train", "val", "test"}
+        assert all(splits[split] for split in splits)
+        graph = dataset[splits["train"][0]]
+        node_tokens = tlx.convert_to_numpy(graph.x)
+        edge_tokens = tlx.convert_to_numpy(graph.edge_attr)
+        labels = tlx.convert_to_numpy(graph.y)
+
+        assert node_tokens.ndim == edge_tokens.ndim == 1
+        assert node_tokens.dtype.kind in "iu"
+        assert edge_tokens.dtype.kind in "iu"
+        assert node_tokens.size == graph.num_nodes
+        assert edge_tokens.size == tlx.convert_to_numpy(graph.edge_index).shape[1]
+        assert node_tokens.size and edge_tokens.size
+        assert node_tokens.min() >= 0 and edge_tokens.min() >= 0
+        assert serializer.serialize(graph).token_ids
+
+        assert dataset.task_type == task_type
+        assert dataset.num_classes == num_classes
+        assert labels.shape == (1, 1)
+        assert labels.dtype.kind == "f"
+        if num_classes:
+            assert float(labels[0, 0]).is_integer()
+            assert 0 <= int(labels[0, 0]) < num_classes
+        else:
+            assert dataset.num_tasks == 1

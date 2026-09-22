@@ -292,8 +292,8 @@ class PreprocessedGraphBenchmark(InMemoryDataset):
                     raise ValueError(
                         f"{self.display_name} classification label {label!r} must be in "
                         f"[0, {self.num_classes}).")
-        if not self.allow_nan_labels and any(math.isnan(item) for item in result):
-            raise ValueError(f"{self.display_name} labels cannot contain NaN values.")
+        if not self.allow_nan_labels and any(not math.isfinite(item) for item in result):
+            raise ValueError(f"{self.display_name} labels must be finite.")
         return result
 
     @staticmethod

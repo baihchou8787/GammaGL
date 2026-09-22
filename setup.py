@@ -210,8 +210,6 @@ extras_require = {
         # Paper protocol runtime; not a GammaGL core dependency.
         'torch>=2.1',
         'dgl>=2.1',
-        'torch-geometric>=2.4',
-        'ogb>=1.3.6',
         # Pinned GTE checkpoint/config acquisition and safetensors conversion.
         'huggingface-hub>=0.20',
         'safetensors>=0.4',

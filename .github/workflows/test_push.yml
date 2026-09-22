@@ -47,4 +47,5 @@ jobs:
             tests/transforms/test_graph_tokenizer.py \
             tests/datasets/test_graph_tokenizer_datasets.py \
             tests/models/test_graph_tokenizer_models.py \
+            tests/models/test_graph_tokenizer_dataset_metadata.py \
             tests/models/test_graph_tokenizer_pipeline.py
