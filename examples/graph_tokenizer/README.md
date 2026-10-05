@@ -12,16 +12,13 @@ BPE／标签归一化，在完整训练集上进行 MLM，再微调、验证、�
 长度超过 `max_length` 的序列化图会被拒绝而非截断，因为截断会丢失图结构。CLI 参数会覆盖
 `PAPER_CONFIGS` 中对应 preset 的值。
 
-## 正式 benchmark、任务与结果状态
+补充数据集的论文报告值与当前复现结果如下：
 
-| 数据集 | CLI 名称 | 任务 | 指标 | 论文结果 | GammaGL reproduction（五 seed 正式训练） |
-| :-- | :-- | :-- | :-- | --: | --: |
-| Mutagenicity | `mutagenicity` | 二分类 | Accuracy ↑ | BERT `87.5 ± 0.9` | pending |
-| Mutagenicity | `mutagenicity` | 二分类 | Accuracy ↑ | GTE `90.1 ± 0.7` | pending |
-| DBLP_v1 | `dblp` | 二分类 | Accuracy ↑ | BERT `93.2 ± 0.1` | pending |
-| DBLP_v1 | `dblp` | 二分类 | Accuracy ↑ | GTE `93.6 ± 0.1` | pending |
-| AQSOL | `aqsol` | 单目标回归 | MAE ↓ | BERT `0.648 ± 0.008` | pending |
-| AQSOL | `aqsol` | 单目标回归 | MAE ↓ | GTE `0.609 ± 0.016` | pending |
+| Dataset | Metric | BERT (Paper) | BERT (Ours) | GTE (Paper) | GTE (Ours) |
+|:--|:--:|--:|--:|--:|--:|
+| **Mutagenicity** | Accuracy ↑ | 0.875 ± 0.009 | 0.7673 ± 0.0175 | 0.901 ± 0.007 | 0.6811 ± 0.0588 |
+| **DBLP** | Accuracy ↑ | 0.932 ± 0.001 | 0.9225 ± 0.0128 | 0.936 ± 0.001 | 0.9210 ± 0.0059 |
+| **AQSOL** | MAE ↓ | 0.648 ± 0.008 | 0.7395 ± 0.0072 | 0.609 ± 0.016 | 0.7077 ± 0.0069 |
 
 论文结果与 GammaGL reproduction 是两个独立栏目：后者只能填写本入口完成的五 seed 正式实验
 汇总，不能复制论文数值。
