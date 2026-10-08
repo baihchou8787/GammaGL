@@ -7,7 +7,11 @@ from typing import Any, Dict, List
 
 from .base_transform import BaseTransform
 from .graph_bpe import GraphBPE
-from .graph_serializer import FrequencyGuidedEulerianSerializer
+from .graph_serializer import (FrequencyGuidedEulerianSerializer,
+                               GraphSerializationResult, SERIALIZER_PROTOCOL_VERSION)
+
+
+TOKENIZER_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -68,9 +72,10 @@ class GraphTokenizer(BaseTransform):
         self.original_token_ids = None
         self.fit_graph_ids_hash = None
         self.fit_num_realizations = 1
-        self.schema_version = 2
+        self.schema_version = TOKENIZER_SCHEMA_VERSION
 
     def fit(self, graphs, graph_ids=None, num_realizations: int = 1):
+        self.schema_version = TOKENIZER_SCHEMA_VERSION
         graphs = list(graphs)
         if not graphs:
             raise ValueError("Cannot fit GraphTokenizer on an empty training corpus.")
@@ -163,30 +168,35 @@ class GraphTokenizer(BaseTransform):
             },
         )
 
-    @staticmethod
-    def realization_start_nodes(graph: Any, num_realizations: int):
-        """Match the paper serializer's evenly spaced start-node variants."""
+    def realization_start_nodes(self, graph: Any, num_realizations: int):
+        """Space starts over first-visit order for the default serializer."""
         num_realizations = int(num_realizations)
         if num_realizations <= 0:
             raise ValueError("num_realizations must be positive.")
         if num_realizations == 1:
             return [None]
-        value = (
-            graph.get("num_nodes") if isinstance(graph, dict)
-            else getattr(graph, "num_nodes", None))
-        if callable(value):
-            value = value()
-        total_nodes = int(value)
+        order = self.serializer.serialize(graph).metadata.get("local_to_original")
+        if order is None:
+            value = (graph.get("num_nodes") if isinstance(graph, dict)
+                     else getattr(graph, "num_nodes", None))
+            if callable(value):
+                value = value()
+            order = list(range(int(value)))
+        total_nodes = len(order)
         if total_nodes <= 0:
             return [None]
         actual_samples = min(num_realizations, total_nodes)
         step = max(1, total_nodes // actual_samples)
-        return [(index * step) % total_nodes for index in range(actual_samples)]
+        return [order[(index * step) % total_nodes] for index in range(actual_samples)]
 
     def decode_graph(self, encoding) -> Dict[str, Any]:
-        """Invert BPE and reconstruct a graph from an encoded token sequence."""
+        """Invert BPE; a full result also restores original node IDs."""
         self._require_fitted()
         if isinstance(encoding, GraphTokenizationResult):
+            serializer_metadata = encoding.metadata.get("serializer", {})
+            if (encoding.metadata.get("tokenizer_schema_version") != TOKENIZER_SCHEMA_VERSION
+                    or serializer_metadata.get("protocol_version") != SERIALIZER_PROTOCOL_VERSION):
+                raise ValueError("Incompatible tokenizer or serializer protocol version.")
             input_ids = encoding.input_ids
         else:
             input_ids = list(encoding)
@@ -197,12 +207,19 @@ class GraphTokenizer(BaseTransform):
                     or input_ids[-1] != self.special_tokens.sep_token_id):
                 raise ValueError("Encoded graph must begin with CLS and end with SEP tokens.")
             input_ids = input_ids[1:-1]
+        if isinstance(encoding, GraphTokenizationResult):
+            # The full result retains the lossless stream even when a held-out
+            # token was mapped to UNK for the model input.
+            token_ids = self._denormalize_serialized_tokens(
+                encoding.serialized_token_ids)
+            return self.serializer.restore_input_metadata(
+                GraphSerializationResult(token_ids, serializer_metadata))
         serialized = self.bpe.decode([
             self.id_to_vocabulary_token.get(token, token)
             for token in input_ids
         ])
-        return self.serializer.deserialize(
-            self._denormalize_serialized_tokens(serialized))
+        token_ids = self._denormalize_serialized_tokens(serialized)
+        return self.serializer.deserialize(token_ids)
 
     def batch_encode_graphs(self, graphs) -> List[GraphTokenizationResult]:
         self._require_fitted()
@@ -419,6 +436,8 @@ class GraphTokenizer(BaseTransform):
         return self.mask_token_sequences(input_ids, mask_prob=mask_prob, seed=seed)
 
     def _require_fitted(self) -> None:
+        if getattr(self, "schema_version", None) != TOKENIZER_SCHEMA_VERSION:
+            raise RuntimeError("Incompatible GraphTokenizer schema; re-fit with the current protocol.")
         if not self._fitted:
             raise RuntimeError("GraphTokenizer must be fit on training graphs before encoding.")
         if getattr(self, "original_token_ids", None) is None:

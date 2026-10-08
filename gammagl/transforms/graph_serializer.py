@@ -1,6 +1,33 @@
+import operator
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from gammagl.data import Graph
+
+
+SERIALIZER_PROTOCOL_VERSION = 3
+
+
+def validate_undirected_graph_semantics(graph: Any) -> None:
+    """Reject explicit direction metadata, ignoring GammaGL's COO inference."""
+    if isinstance(graph, Graph):
+        # BaseGraph.is_directed() infers direction from COO symmetry, and a
+        # stored is_directed field is shadowed by that method on attribute lookup.
+        declarations = graph.to_dict()
+    elif isinstance(graph, dict):
+        declarations = graph
+    else:
+        declarations = {name: getattr(graph, name, None)
+                        for name in ("directed", "is_directed")}
+    for name in ("directed", "is_directed"):
+        value = declarations.get(name)
+        if callable(value):
+            value = value()
+        if value is not None and bool(value):
+            raise ValueError(
+                "Feuler only supports undirected simple graphs; "
+                f"directed graph semantics are unsupported ({name}=True).")
 
 
 @dataclass
@@ -22,8 +49,8 @@ class FrequencyGuidedEulerianSerializer:
     token and a node-reference token, then contains repeated
     ``edge-label, node-label, node-reference`` triples. Components are joined
     by ``component_sep_token_id``. Node labels, edge labels, and node
-    references occupy disjoint integer domains, so the original graph can be
-    recovered from the token stream alone.
+    references occupy disjoint integer domains. The stream recovers an
+    isomorphic labeled graph; result metadata restores original node IDs.
     """
 
     def __init__(
@@ -34,7 +61,12 @@ class FrequencyGuidedEulerianSerializer:
     ):
         self.name = name
         self.include_edge_tokens = include_edge_tokens
-        self.component_sep_token_id = int(component_sep_token_id)
+        self.component_sep_token_id = self._strict_integer(
+            component_sep_token_id,
+            "component_sep_token_id must be an integer.",
+        )
+        if self.component_sep_token_id >= 0:
+            raise ValueError("component_sep_token_id must be a negative integer.")
         self.frequency_map: Dict[Any, int] = {}
 
     def fit(self, graphs: Sequence[Any]):
@@ -61,43 +93,70 @@ class FrequencyGuidedEulerianSerializer:
             component_start = start_node if start_node in component else None
             edges = self._serialize_component(
                 graph_view, component, start_node=component_start)
-            tokens = self._edges_to_tokens(
-                graph_view, edges, component, start_node=component_start)
             component_results.append((
-                tokens,
-                len(edges),
+                edges,
+                component,
+                component_start,
                 self._traversal_signature(graph_view, edges, component),
             ))
 
-        component_results.sort(key=lambda item: (-len(item[0]), item[2]))
+        component_results.sort(key=lambda item: (-len(item[0]), item[3]))
         token_ids: List[int] = []
-        for index, (component_tokens, _, _) in enumerate(component_results):
+        local_references: Dict[int, int] = {}
+        for index, (edges, component, component_start, _) in enumerate(component_results):
             if index > 0:
                 token_ids.append(self.component_sep_token_id)
-            token_ids.extend(component_tokens)
+            token_ids.extend(self._edges_to_tokens(
+                graph_view, edges, component, local_references,
+                start_node=component_start))
 
         return GraphSerializationResult(
             token_ids=token_ids,
             metadata={
                 "method": self.name,
-                "protocol_version": 2,
+                "protocol_version": SERIALIZER_PROTOCOL_VERSION,
                 "num_nodes": graph_view["num_nodes"],
                 "num_components": len(component_results),
                 "num_edges_traversed": sum(
-                    edge_count for _, edge_count, _ in component_results),
+                    len(edges) for edges, _, _, _ in component_results),
                 "start_node": start_node,
+                "local_to_original": list(local_references),
             },
         )
 
     def restore_input_metadata(self, result: GraphSerializationResult) -> Dict[str, List[int]]:
-        """Backward-compatible alias for token-stream reconstruction."""
-        return self.deserialize(result)
+        """Restore original node IDs from a full result and its provenance map."""
+        if not isinstance(result, GraphSerializationResult):
+            raise ValueError("Original node IDs require a full serializer result with metadata.")
+        local = self.deserialize(result)
+        mapping = result.metadata.get("local_to_original")
+        if not isinstance(mapping, list) or sorted(mapping) != list(range(local["num_nodes"])):
+            raise ValueError("Serializer result has invalid local_to_original metadata.")
+        canonical_edges = sorted(
+            (min(mapping[src], mapping[dst]), max(mapping[src], mapping[dst]), label)
+            for src, dst, label in zip(
+                local["edge_index"][0], local["edge_index"][1], local["edge_attr"]))
+        labels = [0] * local["num_nodes"]
+        for local_id, original_id in enumerate(mapping):
+            labels[original_id] = local["x"][local_id]
+        return {
+            "edge_index": [[src for src, _, _ in canonical_edges],
+                           [dst for _, dst, _ in canonical_edges]],
+            "x": labels,
+            "edge_attr": [label for _, _, label in canonical_edges],
+            "num_nodes": local["num_nodes"],
+        }
 
     def deserialize(self, result: GraphSerializationResult) -> Dict[str, List[int]]:
         """Reconstruct a graph from a Feuler token stream without metadata."""
         if not self.include_edge_tokens:
             raise ValueError("Feuler deserialization requires include_edge_tokens=True.")
-        token_ids = result.token_ids if isinstance(result, GraphSerializationResult) else result
+        if isinstance(result, GraphSerializationResult):
+            if result.metadata.get("protocol_version") != SERIALIZER_PROTOCOL_VERSION:
+                raise ValueError("Incompatible serializer protocol version; rebuild the result.")
+            token_ids = result.token_ids
+        else:
+            token_ids = result
         components = self._split_components(token_ids)
         labels_by_node: Dict[int, int] = {}
         edges_by_key: Dict[Tuple[int, int], int] = {}
@@ -232,21 +291,7 @@ class FrequencyGuidedEulerianSerializer:
         }
 
     def _validate_graph_kind(self, graph: Any) -> None:
-        """Reject graph objects that explicitly declare directed semantics.
-
-        A single COO orientation remains a supported *storage* form for one
-        undirected edge.  It is indistinguishable from a directed edge without
-        graph metadata, so objects that expose ``directed`` or ``is_directed``
-        must declare it false.
-        """
-        for name in ("directed", "is_directed"):
-            value = self._get_graph_attr(graph, name)
-            if callable(value):
-                value = value()
-            if value is not None and bool(value):
-                raise ValueError(
-                    "Feuler only supports undirected simple graphs; "
-                    "directed graph semantics are unsupported.")
+        validate_undirected_graph_semantics(graph)
 
     @staticmethod
     def _canonicalize_undirected_edges(
@@ -417,8 +462,7 @@ class FrequencyGuidedEulerianSerializer:
         """Refine node signatures using labels and labeled undirected neighborhoods.
 
         The signature is intentionally independent of the input node numbering.
-        Nodes that remain tied after refinement are structurally equivalent for
-        the supported labeled simple-graph contract.
+        A tie after refinement does not prove that nodes are interchangeable.
         """
         neighbors: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
         for src, dst, edge_label in arcs:
@@ -482,25 +526,30 @@ class FrequencyGuidedEulerianSerializer:
         graph_view: Dict[str, Any],
         edges: Sequence[Tuple[int, int, int]],
         component: Sequence[int],
+        local_references: Dict[int, int],
         start_node: Optional[int] = None,
     ) -> List[int]:
         if not edges:
             return self._node_tokens(
                 graph_view,
                 int(start_node) if start_node is not None
-                else self._select_structural_node(graph_view, component))
+                else self._select_structural_node(graph_view, component),
+                local_references)
 
-        tokens = self._node_tokens(graph_view, edges[0][0])
+        tokens = self._node_tokens(graph_view, edges[0][0], local_references)
         for _, dst, edge_label in edges:
             if self.include_edge_tokens:
                 tokens.append(self.edge_token(edge_label))
-            tokens.extend(self._node_tokens(graph_view, dst))
+            tokens.extend(self._node_tokens(graph_view, dst, local_references))
         return tokens
 
-    def _node_tokens(self, graph_view: Dict[str, Any], node: int) -> List[int]:
+    def _node_tokens(self, graph_view: Dict[str, Any], node: int,
+                     local_references: Dict[int, int]) -> List[int]:
+        if node not in local_references:
+            local_references[node] = len(local_references)
         return [
             self.node_token(graph_view["node_labels"][node]),
-            self.node_reference_token(node),
+            self.node_reference_token(local_references[node]),
         ]
 
     @staticmethod
@@ -525,7 +574,17 @@ class FrequencyGuidedEulerianSerializer:
                 raise ValueError(
                     "Multi-dimensional node and edge features require explicit "
                     "dataset-specific token encoding.")
-        return int(value)
+        return self._strict_integer(
+            value, "Node and edge labels must be integers.")
+
+    @staticmethod
+    def _strict_integer(value: Any, error_message: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(error_message)
+        try:
+            return operator.index(value)
+        except TypeError as error:
+            raise ValueError(error_message) from error
 
 
 class EulerianSerializer(FrequencyGuidedEulerianSerializer):

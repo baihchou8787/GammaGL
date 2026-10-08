@@ -12,6 +12,7 @@ import tensorlayerx as tlx
 from gammagl.data import Graph, InMemoryDataset, download_url
 from gammagl.data.extract import extract_tar, extract_zip
 from gammagl.data.makedirs import makedirs
+from gammagl.transforms.graph_serializer import validate_undirected_graph_semantics
 
 from ._graph_tokenizer_download import materialize_paper_dataset
 
@@ -82,7 +83,7 @@ class PreprocessedGraphBenchmark(InMemoryDataset):
 
     @property
     def processed_file_names(self) -> List[str]:
-        return [tlx.BACKEND + '_data.pt', 'split_indices.json']
+        return [tlx.BACKEND + '_data_v2.pt', 'split_indices_v2.json']
 
     def _download(self):
         if self._has_raw_files() or self._has_processed_files():
@@ -182,6 +183,7 @@ class PreprocessedGraphBenchmark(InMemoryDataset):
 
     def _sample_to_graph(self, sample, index: int) -> Graph:
         if isinstance(sample, Graph):
+            validate_undirected_graph_semantics(sample)
             graph = self._graph_from_mapping({
                 'edge_index': getattr(sample, 'edge_index', None),
                 'x': getattr(sample, 'x', None),
@@ -203,6 +205,7 @@ class PreprocessedGraphBenchmark(InMemoryDataset):
         return graph
 
     def _graph_from_mapping(self, graph_data) -> Graph:
+        validate_undirected_graph_semantics(graph_data)
         if isinstance(graph_data, Graph):
             return graph_data
         if not isinstance(graph_data, dict) and hasattr(graph_data, 'edges'):
@@ -253,6 +256,7 @@ class PreprocessedGraphBenchmark(InMemoryDataset):
             edge_attr=tlx.convert_to_tensor(
                 self._encode_feature_ids(edge_name, edge_attr, is_edge=True), dtype=tlx.int64),
             y=None,
+            directed=False,
         )
 
     def _extract_label(self, label_data) -> List[float]:

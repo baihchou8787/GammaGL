@@ -137,6 +137,31 @@ def test_training_requires_prepared_data_without_network(trainer, tmp_path, monk
         trainer.load_dataset_splits(str(tmp_path / "empty"), trainer.resolve_dataset("aqsol"))
 
 
+@pytest.mark.parametrize("direction", [{"directed": True}, {"is_directed": True}])
+def test_trainer_adapter_rejects_explicit_directed_graphs(trainer, direction):
+    from gammagl.data import Graph
+
+    graph = Graph(edge_index=[[0], [1]], x=[5, 9], edge_attr=[1],
+                  y=[1.0], **direction)
+    with pytest.raises(ValueError, match="directed graph semantics"):
+        trainer.graph_from_gammagl(graph, trainer.resolve_dataset("aqsol"))
+
+
+@pytest.mark.parametrize("edges,direction", [
+    ([[0], [1]], {"directed": False}),
+    ([[0], [1]], {}),
+    ([[0, 1], [1, 0]], {}),
+])
+def test_trainer_adapter_accepts_undirected_coo_storage(trainer, edges, direction):
+    from gammagl.data import Graph
+    from gammagl.transforms.graph_serializer import FrequencyGuidedEulerianSerializer
+
+    graph = Graph(edge_index=edges, x=[5, 9], edge_attr=[1] * len(edges[0]),
+                  y=[1.0], **direction)
+    record = trainer.graph_from_gammagl(graph, trainer.resolve_dataset("aqsol"))
+    assert FrequencyGuidedEulerianSerializer().serialize(record).token_ids
+
+
 @pytest.mark.parametrize("split_name", ("train", "val", "test"))
 def test_encode_splits_rejects_overlong_sequences_for_every_split(trainer, split_name):
     args = SimpleNamespace(dataset="aqsol", num_serializations=1, max_length=8)
@@ -321,8 +346,8 @@ def test_preprocessing_cache_does_not_reuse_records_from_the_previous_schema(
               "val": _aqsol_graphs(trainer, 1, offset=3),
               "test": _aqsol_graphs(trainer, 1, offset=4)}
     current_cache_version = trainer.PREPROCESSING_CACHE_VERSION
-    assert current_cache_version > 1
-    monkeypatch.setattr(trainer, "PREPROCESSING_CACHE_VERSION", 1)
+    assert current_cache_version > 3
+    monkeypatch.setattr(trainer, "PREPROCESSING_CACHE_VERSION", 3)
     stale_path = trainer.preprocessing_cache_path(args, spec)
     stale_path.parent.mkdir(parents=True, exist_ok=True)
     with stale_path.open("wb") as handle:
@@ -336,6 +361,44 @@ def test_preprocessing_cache_does_not_reuse_records_from_the_previous_schema(
     assert tokenizer != "stale"
     assert encoded != "stale"
     assert trainer.preprocessing_cache_path(args, spec) != stale_path
+    monkeypatch.setattr(trainer, "load_dataset_splits",
+                        lambda *_: pytest.fail("new cache must be reused"))
+    assert trainer.load_or_prepare_preprocessing(args, spec)[2]["mean"] == [1.0]
+
+
+def test_legacy_finetune_checkpoint_is_rejected_before_loading_weights(trainer, tmp_path):
+    model = torch.nn.Linear(1, 1)
+    path = tmp_path / "old.pt"
+    torch.save({"model": model.state_dict(), "epoch": 1, "score": 0.5}, path)
+
+    with pytest.raises(ValueError, match="input protocol|schema"):
+        trainer.restore_checkpoint(torch, path, model, torch.device("cpu"))
+
+
+def test_current_cache_path_rejects_legacy_payload(trainer, tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        dataset="aqsol", encoder="bert", data_root=str(tmp_path / "data"),
+        preprocessing_cache_dir=str(tmp_path / "cache"), bpe_merges=2,
+        bpe_min_frequency=2, bpe_backend="python", num_serializations=1,
+        max_length=64)
+    spec = trainer.resolve_dataset("aqsol")
+    path = trainer.preprocessing_cache_path(args, spec)
+    path.parent.mkdir(parents=True)
+    with path.open("wb") as handle:
+        pickle.dump({"tokenizer": "old", "encoded": "old",
+                     "normalizer": "old", "output_dim": "old"}, handle)
+    splits = {"train": _aqsol_graphs(trainer, 3),
+              "val": _aqsol_graphs(trainer, 1, offset=3),
+              "test": _aqsol_graphs(trainer, 1, offset=4)}
+    monkeypatch.setattr(trainer, "load_dataset_splits", lambda *_: splits)
+
+    tokenizer, encoded, _, _ = trainer.load_or_prepare_preprocessing(args, spec)
+
+    assert tokenizer != "old"
+    assert encoded != "old"
+    with path.open("rb") as handle:
+        assert pickle.load(handle)["preprocessing_cache_version"] == (
+            trainer.PREPROCESSING_CACHE_VERSION)
 
 
 def test_warmup_cosine_scheduler_warms_up_then_decays(trainer):

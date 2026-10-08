@@ -207,9 +207,13 @@ extras_require = {
     ],
     'defog': ['rdkit', 'networkx'],
     'graph-tokenizer-paper': [
-        # Paper protocol runtime; not a GammaGL core dependency.
-        'torch>=2.1',
-        'dgl>=2.1',
+        # Verified paper runtime for Python 3.10; not a GammaGL core dependency.
+        'torch==2.1.2',
+        'dgl==2.1.0',
+        'torchdata==0.7.1',
+        # Imported by DGL 2.1 GraphBolt but absent from its wheel metadata.
+        'pydantic>=1.10,<3',
+        'PyYAML>=5.4',
         # Pinned GTE checkpoint/config acquisition and safetensors conversion.
         'huggingface-hub>=0.20',
         'safetensors>=0.4',

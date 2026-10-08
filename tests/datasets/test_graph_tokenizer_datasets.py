@@ -13,6 +13,7 @@ import tensorlayerx as tlx
 
 import gammagl.datasets._graph_tokenizer_download as graph_tokenizer_download
 from gammagl.datasets import AQSOL, GraphTokenizerDBLP, Mutagenicity
+from gammagl.data import Graph
 from gammagl.transforms.graph_serializer import FrequencyGuidedEulerianSerializer
 
 
@@ -27,6 +28,11 @@ class FakeDGLGraph:
 
     def edges(self):
         return self._src, self._dst
+
+
+class ExplicitDirectedDGLGraph(FakeDGLGraph):
+    def is_directed(self):
+        return True
 
 
 def _graph(ndata, edata):
@@ -95,6 +101,53 @@ def test_graph_tokenizer_dblp_loads_official_split_and_default_edge_token(tmp_pa
     assert tlx.convert_to_numpy(graph.x).tolist() == [7, 11]
     assert tlx.convert_to_numpy(graph.edge_attr).tolist() == [0]
     assert float(tlx.convert_to_numpy(graph.y)[0, 0]) == 0.0
+
+
+@pytest.mark.parametrize("graph_data", [
+    {"edge_index": [[0], [1]], "node_token_ids": [5, 9], "directed": True},
+    Graph(edge_index=[[0], [1]], x=[5, 9], directed=True),
+    Graph(edge_index=[[0], [1]], x=[5, 9], is_directed=True),
+    ExplicitDirectedDGLGraph([0], [1], {"node_token_ids": [[5], [9]]}, {}),
+])
+def test_adapter_rejects_explicit_directed_semantics(tmp_path, graph_data):
+    _write_raw(tmp_path, "mutagenicity", [(graph_data, 1)],
+               {"train": [0], "val": [], "test": []})
+    with pytest.raises(ValueError, match="directed graph semantics"):
+        Mutagenicity(root=str(tmp_path))
+
+
+@pytest.mark.parametrize("edges,directed", [
+    ([[0], [1]], False),
+    ([[0], [1]], None),
+    ([[0, 1], [1, 0]], None),
+])
+def test_adapter_accepts_undirected_coo_storage(tmp_path, edges, directed):
+    graph_data = {"edge_index": edges, "node_token_ids": [5, 9]}
+    if directed is not None:
+        graph_data["directed"] = directed
+    _write_raw(tmp_path, "mutagenicity", [(graph_data, 1)],
+               {"train": [0], "val": [], "test": []})
+    graph = Mutagenicity(root=str(tmp_path))[0]
+    assert FrequencyGuidedEulerianSerializer().serialize(graph).token_ids
+
+
+def test_adapter_does_not_reuse_old_processed_graphs(tmp_path):
+    raw = {"edge_index": [[0], [1]], "node_token_ids": [5, 9]}
+    _write_raw(tmp_path, "mutagenicity", [(raw, 1)],
+               {"train": [0], "val": [], "test": []})
+    first = Mutagenicity(root=str(tmp_path))
+    processed = Path(first.processed_dir)
+    (processed / (tlx.BACKEND + "_data.pt")).write_bytes(
+        Path(first.processed_paths[0]).read_bytes())
+    (processed / "split_indices.json").write_bytes(
+        Path(first.processed_paths[1]).read_bytes())
+    raw["directed"] = True
+    with (Path(first.raw_dir) / "data.pkl").open("wb") as handle:
+        pickle.dump([(raw, 1)], handle)
+    for path in first.processed_paths:
+        Path(path).unlink()
+    with pytest.raises(ValueError, match="directed graph semantics"):
+        Mutagenicity(root=str(tmp_path))
 
 
 @pytest.mark.parametrize("dataset_class,dataset_dir", [

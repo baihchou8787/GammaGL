@@ -51,7 +51,7 @@ class GraphBPE:
     def _fit_python(self, token_sequences, original_sequences=None):
         sequences = [self._as_int_list(sequence) for sequence in token_sequences]
         merge_rules: List[MergeRule] = []
-        next_token_id = self._next_token_id(original_sequences or sequences)
+        next_token_id = self._initial_vocab_size(original_sequences or sequences)
 
         for _ in range(self.num_merges):
             pair_counts = self._count_pairs(sequences)
@@ -182,7 +182,8 @@ class GraphBPE:
                 "Use backend='auto' or backend='python' to allow fallback."
             )
 
-        initial_vocab_size = self._next_token_id(original_sequences or token_sequences)
+        initial_vocab_size = self._initial_vocab_size(
+            original_sequences or token_sequences)
         result = graph_bpe_cpp.train_bpe(
             token_sequences,
             num_merges=self.num_merges,
@@ -238,6 +239,12 @@ class GraphBPE:
             if sequence:
                 max_token = max(max_token, max(sequence))
         return max_token + 1
+
+    def _initial_vocab_size(self, sequences: Iterable[List[int]]) -> int:
+        return max(
+            self._next_token_id(sequences),
+            max(self.protected_token_ids, default=-1) + 1,
+        )
 
     @staticmethod
     def _count_pairs(

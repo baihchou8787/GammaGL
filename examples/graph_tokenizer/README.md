@@ -12,7 +12,10 @@ BPE／标签归一化，在完整训练集上进行 MLM，再微调、验证、�
 长度超过 `max_length` 的序列化图会被拒绝而非截断，因为截断会丢失图结构。CLI 参数会覆盖
 `PAPER_CONFIGS` 中对应 preset 的值。
 
-补充数据集的论文报告值与当前复现结果如下：
+## 正式 benchmark、任务与结果状态
+
+下表的 GammaGL 数值是**旧输入协议的历史结果**：节点引用使用原始编号，AQSOL 标签统计量
+还按 serialization 次数加权。局部引用与归一化修复后的六组指标均待重新训练验证。
 
 | Dataset | Metric | BERT (Paper) | BERT (Ours) | GTE (Paper) | GTE (Ours) |
 |:--|:--:|--:|--:|--:|--:|
@@ -22,6 +25,9 @@ BPE／标签归一化，在完整训练集上进行 MLM，再微调、验证、�
 
 论文结果与 GammaGL reproduction 是两个独立栏目：后者只能填写本入口完成的五 seed 正式实验
 汇总，不能复制论文数值。
+
+DBLP_v1 + GTE 的旧输入协议数值由 seeds 42–46 的原始 summary 复算，样本标准差使用 `ddof=1`。
+修复后尚未重跑五 seed，上表数值不能用作新协议的指标。
 
 论文结果表中可能将 Mutagenicity 简写为 `mutag` 或 `muta`；这里它始终指论文使用的
 **Mutagenicity** 数据集，**不是**经典的 188-graph `MUTAG`。Trainer 也接受 `mutag` 和
@@ -33,9 +39,30 @@ BPE／标签归一化，在完整训练集上进行 MLM，再微调、验证、�
 
 当前 `FrequencyGuidedEulerianSerializer` 面向简单无向图，覆盖这三个 GraphTokenizer
 benchmark 的图结构。它支持非连通图、孤立节点及标量节点/边标签；空节点图会保留为零节点
-图。显式声明有向语义的图对象会被拒绝；单向 COO 仅可表示一条无向边的存储形式。
+图。显式声明有向语义的图对象会被拒绝；单向 COO 仅可表示一条无向边的存储形式。原生
+GammaGL `Graph.is_directed()` 根据 COO 对称性推断存储方向，不等同于显式有向声明；
+无方向声明的单向或对称 COO 均可使用，显式 `directed=True` 或 `is_directed=True` 则会被拒绝。
 
 有向图语义、自环和并行边／多重图均不支持，会 fail fast 而不会静默转换。
+
+### 节点引用与置换保证
+
+Feuler 的节点引用 token 使用最终组件顺序及遍历中的首次访问顺序，从 0 开始连续编号。
+重复访问同一节点复用引用，不同组件共享一套局部编号。token stream 单独可恢复同构的带标签图；
+完整 serializer/tokenizer result 中的 `local_to_original` metadata 可恢复原始节点编号。
+原始编号只在该 provenance metadata 中，训练 `input_ids` 不含原始编号。
+若 held-out 图出现未见标签，模型 `input_ids` 可能含 `UNK`，不能单独逆转；完整 result
+保留未损失的 `serialized_token_ids`，可结合 metadata 恢复。
+
+这消除了原始编号直接进入模型输入的问题，但未实现任意图的全局同构规范化。完整 token 与
+`input_ids` 的置换一致性已对三节点示例、带标签路径和环、非连通图及孤立节点验证；显式
+`start_node` 比较使用重编号后的对应节点。结构签名或组件排序键出现平局时仍可能依赖原始编号：
+例如五节点同标签图的边为 `(0,1),(0,2),(0,4),(1,2),(1,3)`，按
+`0→1,1→2,2→3,3→0,4→4` 重编号后，完整输入不同，多起点选择也不能逐项对应。
+四环与三角形中的节点还可具有相同的结构签名，却属于不同拓扑的组件；不能仅凭签名相同
+视为可互换。等长度的路径组件与三角形组件也可在组件排序键上打平。训练协议版本已提升；
+旧 tokenizer、预处理缓存及旧微调 checkpoint 不兼容新输入词表，即使 embedding 形状相同
+也不能复用。正式 GTE 来源 checkpoint 的独立安全校验保持不变。
 
 ## 固定的六组实验 preset
 
@@ -88,14 +115,19 @@ parameter coverage 和 tensor shape；任一校验失败都会停止运行。`--
 
 ## 安装
 
-在运行正式 preset 前，安装论文训练运行时：
+正式论文运行时固定使用 Python 3.10、PyTorch 2.1.2、DGL 2.1.0 和
+torchdata 0.7.1。DGL 2.1 的 GraphBolt 动态库按 PyTorch 版本构建，不能将这里的
+PyTorch 升级到其他版本。先按 CPU 或 CUDA 环境安装对应的 PyTorch 2.1.2 wheel，再安装 extra；
+例如 CPU 环境：
 
 ```bash
+python --version  # Python 3.10.x
+pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
 pip install -e ".[graph-tokenizer-paper]"
 ```
 
-该 extra 包含原生 PyTorch 运行时及 `huggingface-hub`、`safetensors`；正式 GTE 初始化需要它们
-来获取并转换固定 checkpoint。训练前请按 CUDA 环境选择适当的 PyTorch 版本。
+该 extra 同时固定 DGL／torchdata 兼容组合，并包含 `huggingface-hub`、`safetensors`；
+正式 GTE 初始化需要它们来获取并转换固定 checkpoint。
 
 ## 数据准备
 
@@ -138,7 +170,7 @@ python examples/graph_tokenizer/graph_tokenizer_trainer.py \
 
 Mutagenicity 和 DBLP_v1 使用两个 logits 的 CrossEntropy，并在每个图的多次 serialization
 logits 平均后取 `argmax` 计算 Accuracy。AQSOL 使用 MSE 训练；其标签归一化只用 train split
-统计，评估将预测和标签恢复到原始尺度后计算 MAE。
+中每个唯一 graph_id 的标签统计一次，评估将预测和标签恢复到原始尺度后计算 MAE。
 
 常用覆盖参数包括 `--pretrain-batch-size`、`--finetune-batch-size`、
 `--pretrain-learning-rate`、`--learning-rate`、

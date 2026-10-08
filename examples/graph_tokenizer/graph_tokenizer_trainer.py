@@ -53,7 +53,7 @@ DATASETS = (
 )
 
 DEFAULT_SEEDS = (42, 43, 44, 45, 46)
-PREPROCESSING_CACHE_VERSION = 2
+PREPROCESSING_CACHE_VERSION = 4
 
 
 # GammaGL presets derived from the pinned official GraphTokenizer implementation.
@@ -229,6 +229,10 @@ def graph_label(value, width: int, allow_nan: bool) -> List[float]:
 
 
 def graph_from_gammagl(graph, spec: DatasetSpec) -> GraphRecord:
+    ensure_repo_on_path()
+    from gammagl.transforms.graph_serializer import validate_undirected_graph_semantics
+
+    validate_undirected_graph_semantics(graph)
     edge_index = to_list(getattr(graph, "edge_index", [[], []]))
     if len(edge_index) != 2:
         edge_index = [[pair[0] for pair in edge_index], [pair[1] for pair in edge_index]]
@@ -331,6 +335,9 @@ def preprocessing_cache_path(args, spec: DatasetSpec) -> Path:
 
 
 def load_or_prepare_preprocessing(args, spec: DatasetSpec):
+    ensure_repo_on_path()
+    from gammagl.transforms.graph_tokenizer import TOKENIZER_SCHEMA_VERSION
+
     cache_path = preprocessing_cache_path(args, spec)
     try:
         with cache_path.open("rb") as handle:
@@ -338,6 +345,12 @@ def load_or_prepare_preprocessing(args, spec: DatasetSpec):
     except FileNotFoundError:
         cached = None
     except (EOFError, ImportError, pickle.UnpicklingError):
+        cache_path.unlink(missing_ok=True)
+        cached = None
+    if cached is not None and (
+            not isinstance(cached, dict)
+            or cached.get("preprocessing_cache_version") != PREPROCESSING_CACHE_VERSION
+            or getattr(cached.get("tokenizer"), "schema_version", None) != TOKENIZER_SCHEMA_VERSION):
         cache_path.unlink(missing_ok=True)
         cached = None
     if cached is not None:
@@ -352,7 +365,8 @@ def load_or_prepare_preprocessing(args, spec: DatasetSpec):
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = cache_path.with_name(f".{cache_path.name}.tmp-{os.getpid()}")
     with temporary.open("wb") as handle:
-        pickle.dump({"tokenizer": tokenizer, "encoded": encoded,
+        pickle.dump({"preprocessing_cache_version": PREPROCESSING_CACHE_VERSION,
+                     "tokenizer": tokenizer, "encoded": encoded,
                      "normalizer": normalizer, "output_dim": output_dim}, handle,
                     protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(temporary, cache_path)
@@ -419,11 +433,22 @@ def encode_splits(tokenizer, splits, args) -> Dict[str, List[Dict[str, Any]]]:
 def normalize_labels(encoded, spec: DatasetSpec):
     if spec.num_classes:
         return None, spec.output_dim
-    train_values = [[record["labels"][column] for record in encoded["train"]]
-                    for column in range(spec.label_width)]
+    train_values = [[] for _ in range(spec.label_width)]
+    for split_name, records in encoded.items():
+        for variants in group_records(records):
+            label = variants[0]["labels"]
+            if not all(math.isfinite(value) for value in label):
+                raise ValueError("Normalization requires finite labels in every split.")
+            if any(variant["labels"] != label for variant in variants[1:]):
+                raise ValueError(
+                    f"{split_name} graph_id {variants[0]['graph_id']} has "
+                    "inconsistent labels across serializations.")
+            if split_name == "train":
+                for column, value in enumerate(label):
+                    train_values[column].append(value)
     means, stds = [], []
     for values in train_values:
-        if not values or not all(math.isfinite(value) for value in values):
+        if not values:
             raise ValueError("Normalization must be fitted from finite training labels only.")
         mean = sum(values) / len(values)
         means.append(mean)
@@ -647,17 +672,26 @@ def supervised_loss(torch, logits, labels, spec: DatasetSpec):
 
 
 def save_checkpoint(torch, path: Path, model, epoch: int, score: float) -> None:
+    ensure_repo_on_path()
+    from gammagl.transforms.graph_tokenizer import TOKENIZER_SCHEMA_VERSION
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    torch.save({"model": model.state_dict(), "epoch": int(epoch), "score": float(score)}, temporary)
+    torch.save({"model": model.state_dict(), "epoch": int(epoch), "score": float(score),
+                "tokenizer_schema_version": TOKENIZER_SCHEMA_VERSION}, temporary)
     os.replace(temporary, path)
 
 
 def restore_checkpoint(torch, path: Path, model, device):
+    ensure_repo_on_path()
+    from gammagl.transforms.graph_tokenizer import TOKENIZER_SCHEMA_VERSION
+
     try:
         state = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         state = torch.load(path, map_location=device)
+    if state.get("tokenizer_schema_version") != TOKENIZER_SCHEMA_VERSION:
+        raise ValueError("Incompatible checkpoint input protocol; retrain with the current tokenizer schema.")
     model.load_state_dict(state["model"])
     return state
 

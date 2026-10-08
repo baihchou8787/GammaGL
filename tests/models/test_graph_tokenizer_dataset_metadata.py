@@ -68,9 +68,9 @@ def test_classification_synthetic_labels_and_normalization_are_task_driven(train
 def test_aqsol_normalization_uses_only_training_labels_and_mse(trainer):
     spec = trainer.resolve_dataset("aqsol")
     encoded = {
-        "train": [{"labels": [1.0]}, {"labels": [3.0]}],
-        "val": [{"labels": [101.0]}],
-        "test": [{"labels": [-99.0]}],
+        "train": [{"labels": [1.0], "graph_id": 0}, {"labels": [3.0], "graph_id": 1}],
+        "val": [{"labels": [101.0], "graph_id": 0}],
+        "test": [{"labels": [-99.0], "graph_id": 0}],
     }
 
     normalizer, output_dim = trainer.normalize_labels(encoded, spec)
@@ -81,6 +81,40 @@ def test_aqsol_normalization_uses_only_training_labels_and_mse(trainer):
     loss = trainer.supervised_loss(
         torch, torch.tensor([[2.0]]), torch.tensor([[1.0]]), spec)
     assert float(loss) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("extra_variants,val_label", [(1, 100.0), (4, -1000.0)])
+def test_aqsol_normalization_counts_each_training_graph_once(trainer, extra_variants, val_label):
+    encoded = {
+        "train": ([{"graph_id": 0, "labels": [0.0]}] +
+                  [{"graph_id": 1, "labels": [10.0]} for _ in range(extra_variants)]),
+        "val": [{"graph_id": 0, "labels": [val_label]}],
+        "test": [{"graph_id": 0, "labels": [200.0]}],
+    }
+    normalizer, _ = trainer.normalize_labels(encoded, trainer.resolve_dataset("aqsol"))
+    assert normalizer["mean"] == [5.0]
+    assert normalizer["std"] == [5.0]
+    assert [record["labels"] for record in encoded["train"]] == (
+        [[-1.0]] + [[1.0]] * extra_variants)
+    assert encoded["val"][0]["labels"] == [(val_label - 5.0) / 5.0]
+    assert encoded["test"][0]["labels"] == [39.0]
+
+
+def test_aqsol_normalization_rejects_inconsistent_variants(trainer):
+    encoded = {"train": [{"graph_id": 7, "labels": [0.0]},
+                         {"graph_id": 7, "labels": [1.0]}],
+               "val": [], "test": []}
+    with pytest.raises(ValueError, match="graph_id 7.*inconsistent"):
+        trainer.normalize_labels(encoded, trainer.resolve_dataset("aqsol"))
+
+
+def test_aqsol_normalization_preserves_zero_variance_guard(trainer):
+    encoded = {"train": [{"graph_id": 0, "labels": [4.0]},
+                         {"graph_id": 1, "labels": [4.0]}],
+               "val": [{"graph_id": 0, "labels": [5.0]}], "test": []}
+    normalizer, _ = trainer.normalize_labels(encoded, trainer.resolve_dataset("aqsol"))
+    assert normalizer["std"] == [1e-12]
+    assert encoded["val"][0]["labels"] == [1e12]
 
 
 def test_evaluation_uses_argmax_accuracy_and_raw_scale_mae(trainer):

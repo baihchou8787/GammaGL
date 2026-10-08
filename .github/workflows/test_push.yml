@@ -23,7 +23,8 @@ jobs:
       - name: Install base dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 \
+            --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
           pip install pybind11 ninja
           python -m pip install "safetensors>=0.4"
@@ -35,6 +36,7 @@ jobs:
       - name: Verify GraphTokenizer paper extra installs
         run: |
           GAMMAGL_WITH_CUDA=0 pip install -e ".[graph-tokenizer-paper]" --no-build-isolation
+          python tests/datasets/graph_tokenizer_dgl_smoke.py
 
       - name: Run checks
         run: |
