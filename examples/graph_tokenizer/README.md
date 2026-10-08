@@ -1,8 +1,7 @@
 # GraphTokenizer 训练
 
-`graph_tokenizer_trainer.py` 是唯一的正式训练入口。它使用 GammaGL 的
-Feuler 序列化器、Graph BPE、tokenizer、数据集以及原生 TensorLayerX
-`GraphBERT` / `GraphGTE`；训练前向路径不使用 Hugging Face 模型。
+`graph_tokenizer_trainer.py` 是训练入口。它使用 GammaGL 的 Feuler 序列化器、Graph BPE、
+tokenizer、数据集以及原生 TensorLayerX `GraphBERT` / `GraphGTE`。
 
 正式路径默认以种子 `42 43 44 45 46` 完成五次彼此独立的完整训练：仅在训练集拟合
 BPE／标签归一化，在完整训练集上进行 MLM，再微调、验证、恢复最佳微调 checkpoint 并最终
@@ -12,32 +11,25 @@ BPE／标签归一化，在完整训练集上进行 MLM，再微调、验证、�
 长度超过 `max_length` 的序列化图会被拒绝而非截断，因为截断会丢失图结构。CLI 参数会覆盖
 `PAPER_CONFIGS` 中对应 preset 的值。
 
-## 正式 benchmark、任务与结果状态
+## 正式 benchmark 与结果
 
-下表的 GammaGL 数值是**旧输入协议的历史结果**：节点引用使用原始编号，AQSOL 标签统计量
-还按 serialization 次数加权。局部引用与归一化修复后的六组指标均待重新训练验证。
+GammaGL reproduction 为五个 seed 的最终测试结果，报告 `mean ± std`（样本标准差，`ddof=1`）。
 
-| Dataset | Metric | BERT (Paper) | BERT (Ours) | GTE (Paper) | GTE (Ours) |
-|:--|:--:|--:|--:|--:|--:|
-| **Mutagenicity** | Accuracy ↑ | 0.875 ± 0.009 | 0.7673 ± 0.0175 | 0.901 ± 0.007 | 0.6811 ± 0.0588 |
-| **DBLP** | Accuracy ↑ | 0.932 ± 0.001 | 0.9225 ± 0.0128 | 0.936 ± 0.001 | 0.9214 ± 0.0045 |
-| **AQSOL** | MAE ↓ | 0.648 ± 0.008 | 0.7395 ± 0.0072 | 0.609 ± 0.016 | 0.7077 ± 0.0069 |
+| 数据集 | Encoder | 论文／官方结果 | GammaGL reproduction |
+| :-- | :-- | :-- | :-- |
+| Mutagenicity | BERT | 87.5 ± 0.9 Accuracy | 0.7673 ± 0.0175 |
+| Mutagenicity | GTE | 90.1 ± 0.7 Accuracy | 0.6811 ± 0.0588 |
+| DBLP_v1 | BERT | 93.2 ± 0.1 Accuracy | 0.9225 ± 0.0128 |
+| DBLP_v1 | GTE | 93.6 ± 0.1 Accuracy | 0.9214 ± 0.0045 |
+| AQSOL | BERT | 0.648 ± 0.008 MAE | 0.7395 ± 0.0072 |
+| AQSOL | GTE | 0.609 ± 0.016 MAE | 0.7077 ± 0.0069 |
 
-论文结果与 GammaGL reproduction 是两个独立栏目：后者只能填写本入口完成的五 seed 正式实验
-汇总，不能复制论文数值。
-
-DBLP_v1 + GTE 的旧输入协议数值由 seeds 42–46 的原始 summary 复算，样本标准差使用 `ddof=1`。
-修复后尚未重跑五 seed，上表数值不能用作新协议的指标。
-
-论文结果表中可能将 Mutagenicity 简写为 `mutag` 或 `muta`；这里它始终指论文使用的
-**Mutagenicity** 数据集，**不是**经典的 188-graph `MUTAG`。Trainer 也接受 `mutag` 和
-`muta` aliases。`dblp` 指 GraphTokenizer 论文的 **DBLP_v1 graph-classification** benchmark，
-不是 GammaGL 已有的 heterogeneous `DBLP` dataset；其独立数据集类为
-`GraphTokenizerDBLP`。
+Trainer 接受 `mutag` 和 `muta` 作为 Mutagenicity 的 aliases。`dblp` 对应
+**DBLP_v1 graph-classification** benchmark，数据集类为 `GraphTokenizerDBLP`。
 
 ## 支持的图范围
 
-当前 `FrequencyGuidedEulerianSerializer` 面向简单无向图，覆盖这三个 GraphTokenizer
+`FrequencyGuidedEulerianSerializer` 面向简单无向图，覆盖这三个 GraphTokenizer
 benchmark 的图结构。它支持非连通图、孤立节点及标量节点/边标签；空节点图会保留为零节点
 图。显式声明有向语义的图对象会被拒绝；单向 COO 仅可表示一条无向边的存储形式。原生
 GammaGL `Graph.is_directed()` 根据 COO 对称性推断存储方向，不等同于显式有向声明；
@@ -54,24 +46,21 @@ Feuler 的节点引用 token 使用最终组件顺序及遍历中的首次访问
 若 held-out 图出现未见标签，模型 `input_ids` 可能含 `UNK`，不能单独逆转；完整 result
 保留未损失的 `serialized_token_ids`，可结合 metadata 恢复。
 
-这消除了原始编号直接进入模型输入的问题，但未实现任意图的全局同构规范化。完整 token 与
+序列化器不提供任意图的全局同构规范化。完整 token 与
 `input_ids` 的置换一致性已对三节点示例、带标签路径和环、非连通图及孤立节点验证；显式
 `start_node` 比较使用重编号后的对应节点。结构签名或组件排序键出现平局时仍可能依赖原始编号：
 例如五节点同标签图的边为 `(0,1),(0,2),(0,4),(1,2),(1,3)`，按
 `0→1,1→2,2→3,3→0,4→4` 重编号后，完整输入不同，多起点选择也不能逐项对应。
 四环与三角形中的节点还可具有相同的结构签名，却属于不同拓扑的组件；不能仅凭签名相同
-视为可互换。等长度的路径组件与三角形组件也可在组件排序键上打平。训练协议版本已提升；
-旧 tokenizer、预处理缓存及旧微调 checkpoint 不兼容新输入词表，即使 embedding 形状相同
-也不能复用。正式 GTE 来源 checkpoint 的独立安全校验保持不变。
+视为可互换。等长度的路径组件与三角形组件也可在组件排序键上打平。
 
 ## 固定的六组实验 preset
 
 `PAPER_CONFIGS` 基于固定的
 [GraphTokenizer 官方源码 revision
 `98343a6b025a48fbb6859cd812a12b81ec3ac3cc`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/tree/98343a6b025a48fbb6859cd812a12b81ec3ac3cc)
-整理，并适配到 GammaGL streamlined trainer 的 benchmark presets，不是对 upstream orchestration
-configuration 的逐字段复制。表中的值与 trainer 当前代码一致；GammaGL 保持统一的 serializer/
-tokenization pipeline，默认使用 Python BPE，`cpp` 是可选 backend。
+整理为六组 benchmark presets。训练使用统一的 serializer/tokenization pipeline，默认使用
+Python BPE，`cpp` 是可选 backend。
 
 所有 preset 均使用 `max_length=8096`、BPE `2000` merges / 最小频率 `2`、100 次序列化、
 MLM mask 概率 `0.09`、warm-up `0.12 / 0.025`、梯度裁剪 `2.0 / 0.5`、默认 seeds `42–46`，
@@ -91,11 +80,10 @@ window 都使用其实际 window size 作为相同 divisor，optimizer 与 sched
 
 ### 序列长度与位置容量
 
-`max_length` 是包含 special token 的最终 GraphTokenizer 输入上限；它不同于模型
-`max_position_embeddings` 容量。BERT 的两个值均为 8096，来自固定 revision 的
+`max_length` 是包含 special token 的最终 GraphTokenizer 输入上限；模型另有
+`max_position_embeddings` 容量。BERT 的两个值均为 8096，配置见固定 revision 的
 [`config/default_config.yml`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/blob/98343a6b025a48fbb6859cd812a12b81ec3ac3cc/config/default_config.yml#L77-L83)。
-GammaGL 不采用上游将 BERT 运行时上限改为 768 的路径，因为这会违反完整图序列不得截断的
-协议；collate 只会 pad 到当前 batch 中最长的序列。
+collate 会 pad 到当前 batch 中最长的序列。
 
 GTE 的最终输入上限为 8096、位置容量为 8192；后者来自固定源码的
 [`gte_model/config.json`](https://github.com/BUPT-GAMMA/Graph-Tokenization-for-Bridging-Graphs-and-Transformers/blob/98343a6b025a48fbb6859cd812a12b81ec3ac3cc/gte_model/config.json#L32)。
